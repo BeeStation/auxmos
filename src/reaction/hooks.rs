@@ -153,10 +153,10 @@ fn fusion(byond_air: Value, holder: Value) {
 	const FUSION_TRITIUM_CONVERSION_COEFFICIENT: f32 = 2E-3;
 	const FUSION_MOLE_THRESHOLD: f32 = 250.0;
 	const TOROID_CALCULATED_THRESHOLD: f32 = 5.96; //changing it by 0.1 generally doubles or halves fusion temps
-	const FUSION_BASE_TEMPSCALE f32: = 6.0;
-	const FUSION_SLOPE_DIVISOR f32: = 1250.0;
-	const FUSION_SCALE_DIVISOR f32: = 10.0;
-	const FUSION_MINIMAL_SCALE f32: = 50.0;
+	const FUSION_BASE_TEMPSCALE: f32 = 6.0;
+	const FUSION_SLOPE_DIVISOR: f32 = 1250.0;
+	const FUSION_SCALE_DIVISOR: f32 = 10.0;
+	const FUSION_MINIMAL_SCALE: f32 = 50.0;
 	const FUSION_MIDDLE_ENERGY_REFERENCE: f32 = 1E+6;
 	const FUSION_ENERGY_TRANSLATION_EXPONENT: f32 = 1.25;
 	let temperature_scale = air.return_temperature().log10();
@@ -194,13 +194,13 @@ fn fusion(byond_air: Value, holder: Value) {
 			std::cmp::max(delta_plasma * PLASMA_BINDING_ENERGY, 0);
 		} else {
 			delta_plasma * PLASMA_BINDING_ENERGY
-				* (instability - FUSION_INSTABILITY_ENDOTHERMALITY).pow(.5);
+				* (instability - FUSION_INSTABILITY_ENDOTHERMALITY).pow(0.5);
 		}
 	};
 	if reaction_energy != 0.0 {
 		let middle_energy = (((TOROID_CALCULATED_THRESHOLD / 2) * scale_factor) + FUSION_MOLE_THRESHOLD)
 			* (200 * FUSION_MIDDLE_ENERGY_REFERENCE);
-		initial_energy = middle_energy * FUSION_ENERGY_TRANSLATION_EXPONENT.pow((thermal_energy / middle_energy).log10)
+		initial_energy = middle_energy * FUSION_ENERGY_TRANSLATION_EXPONENT.pow((thermal_energy / middle_energy).log10);
 		let bowdlerized_reaction_energy = reaction_energy.clamp(thermal_energy * ((1 / FUSION_ENERGY_TRANSLATION_EXPONENT)).powi(2) - 1,
 			thermal_energy * (FUSION_ENERGY_TRANSLATION_EXPONENT.powi(2) - 1));
 		initial_energy = middle_energy * 10.pow(((thermal_energy + bowdlerized_reaction_energy) / middle_energy)
@@ -217,12 +217,11 @@ fn fusion(byond_air: Value, holder: Value) {
 			air.set_moles(co2, carbon * scale_factor + FUSION_MOLE_THRESHOLD);
 			let standard_waste_gas_output = scale_factor * (FUSION_TRITIUM_CONVERSION_COEFFICIENT * FUSION_TRITIUM_MOLES_USED);
 			if delta_plasma > 0 {
-				air.adjust_moles(gas_idx_from_string(GAS_H2O, standard_waste_gas_output));
+				air.adjust_moles(gas_idx_from_string(GAS_H2O), standard_waste_gas_output);
 			} else {
-				air.adjust_moles(gas_idx_from_string(GAS_BZ, standard_waste_gas_output));
+				air.adjust_moles(gas_idx_from_string(GAS_BZ), standard_waste_gas_output);
 			}
-			air.adjust_moles(gas_idx_from_string(GAS_O2));
-			air.adjust_moles(
+			air.adjust_moles(gas_idx_from_string(GAS_O2), standard_waste_gas_output);
 			if reaction_energy != 0.0 {
 				air.set_temperature((initial_energy + reaction_energy) / air.heat_capacity());
 			}
@@ -241,7 +240,6 @@ fn fusion(byond_air: Value, holder: Value) {
 		} else {
 			Ok(Value::from(0.0))
 		}
-	}
 }
 
 #[cfg(feature = "generic_fire_hook")]

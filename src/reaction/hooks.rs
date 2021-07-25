@@ -151,7 +151,7 @@ fn fusion(byond_air: Value, holder: Value) {
 	const FUSION_INSTABILITY_ENDOTHERMALITY: f32 = 2.0;
 	const FUSION_TRITIUM_CONVERSION_COEFFICIENT: f32 = 2E-3;
 	const FUSION_MOLE_THRESHOLD: f32 = 250.0;
-	const TOROID_CALCULATED_THRESHOLD: f32 = 5.96; //changing it by 0.1 generally doubles or halves fusion temps
+	const TOROID_CALCULATED_THRESHOLD: f32 = 5.96;
 	const FUSION_BASE_TEMPSCALE: f32 = 6.0;
 	const FUSION_SLOPE_DIVISOR: f32 = 1250.0;
 	const FUSION_SCALE_DIVISOR: f32 = 10.0;
@@ -185,7 +185,7 @@ fn fusion(byond_air: Value, holder: Value) {
 	let mut carbon = (initial_carbon - FUSION_MOLE_THRESHOLD) / scale_factor;
 	plasma = (plasma - (instability * carbon.sin())) % toroidal_size;
 	//count the rings. ss13's modulus is positive, this ain't, who knew
-	carbon = (carbon - plasma) % toroidal_size;
+	carbon = (carbon - plasma).rem_euclid(toroidal_size);
 	plasma = plasma * scale_factor + FUSION_MOLE_THRESHOLD;
 	carbon = carbon * scale_factor + FUSION_MOLE_THRESHOLD;
 	let delta_plasma = (initial_plasma - plasma).min(toroidal_size * scale_factor * 1.5);

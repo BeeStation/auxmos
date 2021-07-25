@@ -168,7 +168,7 @@ fn fusion(byond_air: Value, holder: Value) {
 				air.thermal_energy(),
 				air.get_moles(plas),
 				air.get_moles(co2),
-				.max(air.return_volume() / FUSION_SCALE_DIVISOR, FUSION_MINIMAL_SCALE),
+				std::cmp::max(air.return_volume() / FUSION_SCALE_DIVISOR, FUSION_MINIMAL_SCALE),
 				TOROID_CALCULATED_THRESHOLD
 					+ if temperature_scale <= FUSION_BASE_TEMPSCALE {
 						temperature_scale - FUSION_BASE_TEMPSCALE;
@@ -189,9 +189,9 @@ fn fusion(byond_air: Value, holder: Value) {
 	//count the rings. ss13's modulus is positive, this ain't, who knew
 	carbon = (carbon - plasma).rem_euclid(toroidal_size);
 	let reaction_energy = {
-		let delta_plasma = min(initial_plasma - plasma, toroidal_size * scale_factor * 1.5);
+		let delta_plasma = std::cmp::min(initial_plasma - plasma, toroidal_size * scale_factor * 1.5);
 		if instability <= FUSION_INSTABILITY_ENDOTHERMALITY || delta_plasma > 0.0 {
-			.max(delta_plasma * PLASMA_BINDING_ENERGY, 0);
+			std::cmp::max(delta_plasma * PLASMA_BINDING_ENERGY, 0);
 		} else {
 			delta_plasma * PLASMA_BINDING_ENERGY
 				* (instability - FUSION_INSTABILITY_ENDOTHERMALITY).pow(.5);

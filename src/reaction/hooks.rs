@@ -97,7 +97,7 @@ fn tritfire(byond_air: &Value, holder: &Value) {
 	const TRITIUM_BURN_OXY_FACTOR: f32 = 100.0;
 	const TRITIUM_BURN_TRIT_FACTOR: f32 = 10.0;
 	const TRITIUM_MINIMUM_RADIATION_FACTOR: f32 = 0.1;
-	const FIRE_HYDROGEN_ENERGY_RELEASED: f32 = 280000.0;
+	const FIRE_HYDROGEN_ENERGY_RELEASED: f32 = 200000.0;
 	let o2 = gas_idx_from_string(GAS_O2)?;
 	let tritium = gas_idx_from_string(GAS_TRITIUM)?;
 	let water = gas_idx_from_string(GAS_H2O)?;

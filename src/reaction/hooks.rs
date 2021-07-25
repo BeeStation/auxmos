@@ -145,8 +145,7 @@ fn tritfire(byond_air: &Value, holder: &Value) {
 #[cfg(feature = "fusion_hook")]
 #[hook("/datum/gas_reaction/fusion/react")]
 fn fusion(byond_air: Value, holder: Value) {
-	use std::f32::consts::PI;
-	const INSTABILITY_GAS_FACTOR: f32 = 3;
+	const INSTABILITY_GAS_FACTOR: f32 = 3.0;
 	const PLASMA_BINDING_ENERGY: f32 = 20_000_000.0;
 	const FUSION_TRITIUM_MOLES_USED: f32 = 1.0;
 	const FUSION_INSTABILITY_ENDOTHERMALITY: f32 = 2.0;
@@ -159,7 +158,7 @@ fn fusion(byond_air: Value, holder: Value) {
 	const FUSION_MINIMAL_SCALE: f32 = 50.0;
 	const FUSION_MIDDLE_ENERGY_REFERENCE: f32 = 1E+6;
 	const FUSION_ENERGY_TRANSLATION_EXPONENT: f32 = 1.25;
-	let temperature_scale = air.return_temperature().log10();
+	let temperature_scale = with_mix(byond_air, |air| {Ok(air.get_temperature().log10(),)})?;
 	let plas = gas_idx_from_string(GAS_PLASMA)?;
 	let co2 = gas_idx_from_string(GAS_CO2)?;
 	let (initial_energy, initial_plasma, initial_carbon, scale_factor, toroidal_size, gas_power) =
@@ -168,13 +167,13 @@ fn fusion(byond_air: Value, holder: Value) {
 				air.thermal_energy(),
 				air.get_moles(plas),
 				air.get_moles(co2),
-				std::cmp::max(air.return_volume() / FUSION_SCALE_DIVISOR, FUSION_MINIMAL_SCALE),
+				(air.volume / FUSION_SCALE_DIVISOR).max(FUSION_MINIMAL_SCALE),
 				TOROID_CALCULATED_THRESHOLD
 					+ if temperature_scale <= FUSION_BASE_TEMPSCALE {
-						temperature_scale - FUSION_BASE_TEMPSCALE;
+						temperature_scale - FUSION_BASE_TEMPSCALE
 					} else {
-						4.pow((temperature_scale - FUSION_BASE_TEMPSCALE)
-							/ FUSION_SLOPE_DIVISOR);
+						4.0_f32.powf((temperature_scale - FUSION_BASE_TEMPSCALE)
+							/ FUSION_SLOPE_DIVISOR)
 					},
 				air.enumerate()
 					.fold(0.0, |acc, (i, amt)| acc + gas_fusion_power(&i) * amt),
@@ -188,22 +187,23 @@ fn fusion(byond_air: Value, holder: Value) {
 	plasma = (plasma - instability * carbon.sin()).rem_euclid(toroidal_size);
 	//count the rings. ss13's modulus is positive, this ain't, who knew
 	carbon = (carbon - plasma).rem_euclid(toroidal_size);
+	let delta_plasma = (initial_plasma - plasma).min(toroidal_size * scale_factor * 1.5);
 	let reaction_energy = {
-		let delta_plasma = std::cmp::min(initial_plasma - plasma, toroidal_size * scale_factor * 1.5);
 		if instability <= FUSION_INSTABILITY_ENDOTHERMALITY || delta_plasma > 0.0 {
-			std::cmp::max(delta_plasma * PLASMA_BINDING_ENERGY, 0);
+			(delta_plasma * PLASMA_BINDING_ENERGY).max(0.0)
 		} else {
 			delta_plasma * PLASMA_BINDING_ENERGY
-				* (instability - FUSION_INSTABILITY_ENDOTHERMALITY).pow(0.5);
+				* (instability - FUSION_INSTABILITY_ENDOTHERMALITY).powf(0.5)
 		}
 	};
+	let mut initial_energy = initial_energy;
 	if reaction_energy != 0.0 {
-		let middle_energy = (((TOROID_CALCULATED_THRESHOLD / 2) * scale_factor) + FUSION_MOLE_THRESHOLD)
-			* (200 * FUSION_MIDDLE_ENERGY_REFERENCE);
-		initial_energy = middle_energy * FUSION_ENERGY_TRANSLATION_EXPONENT.pow((thermal_energy / middle_energy).log10);
-		let bowdlerized_reaction_energy = reaction_energy.clamp(thermal_energy * ((1 / FUSION_ENERGY_TRANSLATION_EXPONENT)).powi(2) - 1,
-			thermal_energy * (FUSION_ENERGY_TRANSLATION_EXPONENT.powi(2) - 1));
-		initial_energy = middle_energy * 10.pow(((thermal_energy + bowdlerized_reaction_energy) / middle_energy)
+		let middle_energy = (((TOROID_CALCULATED_THRESHOLD / 2.0) * scale_factor) + FUSION_MOLE_THRESHOLD)
+			* (200.0 * FUSION_MIDDLE_ENERGY_REFERENCE);
+		initial_energy = middle_energy * FUSION_ENERGY_TRANSLATION_EXPONENT.powf((initial_energy / middle_energy).log10());
+		let bowdlerized_reaction_energy = reaction_energy.clamp(initial_energy * ((1.0 / FUSION_ENERGY_TRANSLATION_EXPONENT)).powi(2) - 1.0,
+			initial_energy * (FUSION_ENERGY_TRANSLATION_EXPONENT.powi(2) - 1.0));
+		initial_energy = middle_energy * 10.0_f32.powf(((initial_energy + bowdlerized_reaction_energy) / middle_energy)
 			.log(FUSION_ENERGY_TRANSLATION_EXPONENT));
 	}
 	if initial_energy + reaction_energy < 0.0 {
@@ -215,7 +215,7 @@ fn fusion(byond_air: Value, holder: Value) {
 			air.set_moles(plas, plasma * scale_factor + FUSION_MOLE_THRESHOLD);
 			air.set_moles(co2, carbon * scale_factor + FUSION_MOLE_THRESHOLD);
 			let standard_waste_gas_output = scale_factor * (FUSION_TRITIUM_CONVERSION_COEFFICIENT * FUSION_TRITIUM_MOLES_USED);
-			if delta_plasma > 0 {
+			if delta_plasma > 0.0 {
 				air.adjust_moles(gas_idx_from_string(GAS_H2O)?, standard_waste_gas_output);
 			} else {
 				air.adjust_moles(gas_idx_from_string(GAS_BZ)?, standard_waste_gas_output);

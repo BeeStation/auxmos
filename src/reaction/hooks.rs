@@ -183,9 +183,11 @@ fn fusion(byond_air: Value, holder: Value) {
 	byond_air.call("set_analyzer_results", &[&Value::from(instability)])?;
 	let mut plasma = (initial_plasma - FUSION_MOLE_THRESHOLD) / scale_factor;
 	let mut carbon = (initial_carbon - FUSION_MOLE_THRESHOLD) / scale_factor;
-	plasma = (plasma - (instability * carbon.to_degrees().sin())) % toroidal_size;
+	plasma = (plasma - (instability * carbon.sin())) % toroidal_size;
 	//count the rings. ss13's modulus is positive, this ain't, who knew
 	carbon = (carbon - plasma) % toroidal_size;
+	plasma = plasma * scale_factor + FUSION_MOLE_THRESHOLD;
+	carbon = carbon * scale_factor + FUSION_MOLE_THRESHOLD;
 	let delta_plasma = (initial_plasma - plasma).min(toroidal_size * scale_factor * 1.5);
 	let reaction_energy = {
 		if instability <= FUSION_INSTABILITY_ENDOTHERMALITY || delta_plasma > 0.0 {
@@ -211,8 +213,8 @@ fn fusion(byond_air: Value, holder: Value) {
 		let tritium = gas_idx_from_string(GAS_TRITIUM)?;
 		with_mix_mut(byond_air, |air| {
 			air.adjust_moles(tritium, -FUSION_TRITIUM_MOLES_USED);
-			air.set_moles(plas, plasma * scale_factor + FUSION_MOLE_THRESHOLD);
-			air.set_moles(co2, carbon * scale_factor + FUSION_MOLE_THRESHOLD);
+			air.set_moles(plas, plasma);
+			air.set_moles(co2, carbon);
 			let standard_waste_gas_output = scale_factor * (FUSION_TRITIUM_CONVERSION_COEFFICIENT * FUSION_TRITIUM_MOLES_USED);
 			if delta_plasma > 0.0 {
 				air.adjust_moles(gas_idx_from_string(GAS_H2O)?, standard_waste_gas_output);

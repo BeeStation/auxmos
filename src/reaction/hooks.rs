@@ -172,21 +172,20 @@ fn fusion(byond_air: Value, holder: Value) {
 					+ if temperature_scale <= FUSION_BASE_TEMPSCALE {
 						temperature_scale - FUSION_BASE_TEMPSCALE
 					} else {
-						4.0_f32.powf((temperature_scale - FUSION_BASE_TEMPSCALE)
-							/ FUSION_SLOPE_DIVISOR)
+						4.0_f32.powf(temperature_scale - FUSION_BASE_TEMPSCALE)
+							/ FUSION_SLOPE_DIVISOR
 					},
 				air.enumerate()
 					.fold(0.0, |acc, (i, amt)| acc + gas_fusion_power(&i) * amt),
 			))
 		})?;
-	let instability = (gas_power * INSTABILITY_GAS_FACTOR)
-		.rem_euclid(toroidal_size);
+	let instability = (gas_power * INSTABILITY_GAS_FACTOR) % toroidal_size;
 	byond_air.call("set_analyzer_results", &[&Value::from(instability)])?;
 	let mut plasma = (initial_plasma - FUSION_MOLE_THRESHOLD) / scale_factor;
 	let mut carbon = (initial_carbon - FUSION_MOLE_THRESHOLD) / scale_factor;
-	plasma = (plasma - instability * carbon.sin()).rem_euclid(toroidal_size);
+	plasma = (plasma - (instability * carbon.to_degrees().sin())) % toroidal_size;
 	//count the rings. ss13's modulus is positive, this ain't, who knew
-	carbon = (carbon - plasma).rem_euclid(toroidal_size);
+	carbon = (carbon - plasma) % toroidal_size;
 	let delta_plasma = (initial_plasma - plasma).min(toroidal_size * scale_factor * 1.5);
 	let reaction_energy = {
 		if instability <= FUSION_INSTABILITY_ENDOTHERMALITY || delta_plasma > 0.0 {
@@ -201,7 +200,7 @@ fn fusion(byond_air: Value, holder: Value) {
 		let middle_energy = (((TOROID_CALCULATED_THRESHOLD / 2.0) * scale_factor) + FUSION_MOLE_THRESHOLD)
 			* (200.0 * FUSION_MIDDLE_ENERGY_REFERENCE);
 		initial_energy = middle_energy * FUSION_ENERGY_TRANSLATION_EXPONENT.powf((initial_energy / middle_energy).log10());
-		let bowdlerized_reaction_energy = reaction_energy.clamp(initial_energy * ((1.0 / FUSION_ENERGY_TRANSLATION_EXPONENT)).powi(2) - 1.0,
+		let bowdlerized_reaction_energy = reaction_energy.clamp(initial_energy * ((1.0 / FUSION_ENERGY_TRANSLATION_EXPONENT).powi(2) - 1.0),
 			initial_energy * (FUSION_ENERGY_TRANSLATION_EXPONENT.powi(2) - 1.0));
 		initial_energy = middle_energy * 10.0_f32.powf(((initial_energy + bowdlerized_reaction_energy) / middle_energy)
 			.log(FUSION_ENERGY_TRANSLATION_EXPONENT));
@@ -221,8 +220,8 @@ fn fusion(byond_air: Value, holder: Value) {
 				air.adjust_moles(gas_idx_from_string(GAS_BZ)?, standard_waste_gas_output);
 			}
 			air.adjust_moles(gas_idx_from_string(GAS_O2)?, standard_waste_gas_output);
-			if reaction_energy != 0.0 {
-				air.set_temperature((initial_energy + reaction_energy) / air.heat_capacity());
+			if reaction_energy != 0.0 || instability <= FUSION_INSTABILITY_ENDOTHERMALITY {
+				air.set_temperature((initial_energy / air.heat_capacity()).clamp(TCMB, std::f32::MAX));
 			}
 			air.garbage_collect();
 			Ok(())

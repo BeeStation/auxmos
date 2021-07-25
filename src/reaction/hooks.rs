@@ -146,13 +146,20 @@ fn tritfire(byond_air: &Value, holder: &Value) {
 #[hook("/datum/gas_reaction/fusion/react")]
 fn fusion(byond_air: Value, holder: Value) {
 	use std::f32::consts::PI;
-	const TOROID_VOLUME_BREAKEVEN: f32 = 1000.0;
-	const INSTABILITY_GAS_FACTOR: f32 = 0.003;
+	const INSTABILITY_GAS_FACTOR: f32 = 3;
 	const PLASMA_BINDING_ENERGY: f32 = 20_000_000.0;
 	const FUSION_TRITIUM_MOLES_USED: f32 = 1.0;
 	const FUSION_INSTABILITY_ENDOTHERMALITY: f32 = 2.0;
-	const FUSION_TRITIUM_CONVERSION_COEFFICIENT: f32 = 1E-10;
+	const FUSION_TRITIUM_CONVERSION_COEFFICIENT: f32 = 2E-3;
 	const FUSION_MOLE_THRESHOLD: f32 = 250.0;
+	const TOROID_CALCULATED_THRESHOLD: f32 = 5.96; //changing it by 0.1 generally doubles or halves fusion temps
+	const FUSION_BASE_TEMPSCALE f32: = 6.0;
+	const FUSION_SLOPE_DIVISOR f32: = 1250.0;
+	const FUSION_SCALE_DIVISOR f32: = 10.0;
+	const FUSION_MINIMAL_SCALE f32: = 50.0;
+	const FUSION_MIDDLE_ENERGY_REFERENCE: f32 = 1E+6;
+	const FUSION_ENERGY_TRANSLATION_EXPONENT: f32 = 1.25;
+	let temperature_scale = air.return_temperature().log10();
 	let plas = gas_idx_from_string(GAS_PLASMA)?;
 	let co2 = gas_idx_from_string(GAS_CO2)?;
 	let (initial_energy, initial_plasma, initial_carbon, scale_factor, toroidal_size, gas_power) =
@@ -161,15 +168,19 @@ fn fusion(byond_air: Value, holder: Value) {
 				air.thermal_energy(),
 				air.get_moles(plas),
 				air.get_moles(co2),
-				air.volume / PI,
-				(2.0 * PI)
-					+ ((air.volume - TOROID_VOLUME_BREAKEVEN) / TOROID_VOLUME_BREAKEVEN).atan(),
+				.max(air.return_volume() / FUSION_SCALE_DIVISOR, FUSION_MINIMAL_SCALE),
+				TOROID_CALCULATED_THRESHOLD
+					+ if temperature_scale <= FUSION_BASE_TEMPSCALE {
+						temperature_scale - FUSION_BASE_TEMPSCALE;
+					} else {
+						4.pow((temperature_scale - FUSION_BASE_TEMPSCALE)
+							/ FUSION_SLOPE_DIVISOR);
+					},
 				air.enumerate()
 					.fold(0.0, |acc, (i, amt)| acc + gas_fusion_power(&i) * amt),
 			))
 		})?;
 	let instability = (gas_power * INSTABILITY_GAS_FACTOR)
-		.powi(2)
 		.rem_euclid(toroidal_size);
 	byond_air.call("set_analyzer_results", &[&Value::from(instability)])?;
 	let mut plasma = (initial_plasma - FUSION_MOLE_THRESHOLD) / scale_factor;
@@ -177,53 +188,41 @@ fn fusion(byond_air: Value, holder: Value) {
 	plasma = (plasma - instability * carbon.sin()).rem_euclid(toroidal_size);
 	//count the rings. ss13's modulus is positive, this ain't, who knew
 	carbon = (carbon - plasma).rem_euclid(toroidal_size);
-	plasma = plasma * scale_factor + FUSION_MOLE_THRESHOLD;
-	carbon = carbon * scale_factor + FUSION_MOLE_THRESHOLD;
 	let reaction_energy = {
-		let delta_plasma = initial_plasma - plasma;
-		if delta_plasma < 0.0 {
-			if instability < FUSION_INSTABILITY_ENDOTHERMALITY {
-				0.0
-			} else {
-				delta_plasma
-					* PLASMA_BINDING_ENERGY
-					* (instability - FUSION_INSTABILITY_ENDOTHERMALITY).sqrt()
-			}
+		let delta_plasma = min(initial_plasma - plasma, toroidal_size * scale_factor * 1.5);
+		if instability <= FUSION_INSTABILITY_ENDOTHERMALITY || delta_plasma > 0.0 {
+			.max(delta_plasma * PLASMA_BINDING_ENERGY, 0);
 		} else {
 			delta_plasma * PLASMA_BINDING_ENERGY
+				* (instability - FUSION_INSTABILITY_ENDOTHERMALITY).pow(.5);
 		}
 	};
+	if reaction_energy != 0.0 {
+		let middle_energy = (((TOROID_CALCULATED_THRESHOLD / 2) * scale_factor) + FUSION_MOLE_THRESHOLD)
+			* (200 * FUSION_MIDDLE_ENERGY_REFERENCE);
+		initial_energy = middle_energy * FUSION_ENERGY_TRANSLATION_EXPONENT.pow((thermal_energy / middle_energy).log10)
+		let bowdlerized_reaction_energy = reaction_energy.clamp(thermal_energy * ((1 / FUSION_ENERGY_TRANSLATION_EXPONENT)).powi(2) - 1,
+			thermal_energy * (FUSION_ENERGY_TRANSLATION_EXPONENT.powi(2) - 1));
+		initial_energy = middle_energy * 10.pow(((thermal_energy + bowdlerized_reaction_energy) / middle_energy)
+			.log(FUSION_ENERGY_TRANSLATION_EXPONENT));
+	}
 	if initial_energy + reaction_energy < 0.0 {
 		Ok(Value::from(0.0))
 	} else {
 		let tritium = gas_idx_from_string(GAS_TRITIUM)?;
-		let (byproduct_a, byproduct_b, tritium_conversion_coefficient) = {
-			if reaction_energy > 0.0 {
-				(
-					gas_idx_from_string(GAS_O2)?,
-					gas_idx_from_string(GAS_NITROUS)?,
-					FUSION_TRITIUM_CONVERSION_COEFFICIENT,
-				)
-			} else {
-				(
-					gas_idx_from_string(GAS_BZ)?,
-					gas_idx_from_string(GAS_NITRYL)?,
-					-FUSION_TRITIUM_CONVERSION_COEFFICIENT,
-				)
-			}
 		};
 		with_mix_mut(byond_air, |air| {
 			air.adjust_moles(tritium, -FUSION_TRITIUM_MOLES_USED);
-			air.set_moles(plas, plasma);
-			air.set_moles(co2, carbon);
+			air.set_moles(plas, plasma * scale_factor + FUSION_MOLE_THRESHOLD);
+			air.set_moles(co2, carbon * scale_factor + FUSION_MOLE_THRESHOLD);
+			let standard_waste_gas_output = scale_factor * (FUSION_TRITIUM_CONVERSION_COEFFICIENT * FUSION_TRITIUM_MOLES_USED);
+			if delta_plasma > 0 {
+				air.adjust_moles(gas_idx_from_string(GAS_H2O, standard_waste_gas_output));
+			} else {
+				air.adjust_moles(gas_idx_from_string(GAS_BZ, standard_waste_gas_output));
+			}
+			air.adjust_moles(gas_idx_from_string(GAS_O2));
 			air.adjust_moles(
-				byproduct_a,
-				FUSION_TRITIUM_MOLES_USED * (reaction_energy * tritium_conversion_coefficient),
-			);
-			air.adjust_moles(
-				byproduct_b,
-				FUSION_TRITIUM_MOLES_USED * (reaction_energy * tritium_conversion_coefficient),
-			);
 			if reaction_energy != 0.0 {
 				air.set_temperature((initial_energy + reaction_energy) / air.heat_capacity());
 			}

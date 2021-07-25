@@ -210,18 +210,17 @@ fn fusion(byond_air: Value, holder: Value) {
 		Ok(Value::from(0.0))
 	} else {
 		let tritium = gas_idx_from_string(GAS_TRITIUM)?;
-		};
 		with_mix_mut(byond_air, |air| {
 			air.adjust_moles(tritium, -FUSION_TRITIUM_MOLES_USED);
 			air.set_moles(plas, plasma * scale_factor + FUSION_MOLE_THRESHOLD);
 			air.set_moles(co2, carbon * scale_factor + FUSION_MOLE_THRESHOLD);
 			let standard_waste_gas_output = scale_factor * (FUSION_TRITIUM_CONVERSION_COEFFICIENT * FUSION_TRITIUM_MOLES_USED);
 			if delta_plasma > 0 {
-				air.adjust_moles(gas_idx_from_string(GAS_H2O), standard_waste_gas_output);
+				air.adjust_moles(gas_idx_from_string(GAS_H2O)?, standard_waste_gas_output);
 			} else {
-				air.adjust_moles(gas_idx_from_string(GAS_BZ), standard_waste_gas_output);
+				air.adjust_moles(gas_idx_from_string(GAS_BZ)?, standard_waste_gas_output);
 			}
-			air.adjust_moles(gas_idx_from_string(GAS_O2), standard_waste_gas_output);
+			air.adjust_moles(gas_idx_from_string(GAS_O2)?, standard_waste_gas_output);
 			if reaction_energy != 0.0 {
 				air.set_temperature((initial_energy + reaction_energy) / air.heat_capacity());
 			}
@@ -240,6 +239,7 @@ fn fusion(byond_air: Value, holder: Value) {
 		} else {
 			Ok(Value::from(0.0))
 		}
+	}
 }
 
 #[cfg(feature = "generic_fire_hook")]

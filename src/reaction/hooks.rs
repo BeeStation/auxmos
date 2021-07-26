@@ -183,7 +183,7 @@ fn fusion(byond_air: Value, holder: Value) {
 	byond_air.call("set_analyzer_results", &[&Value::from(instability)])?;
 	let mut plasma = (initial_plasma - FUSION_MOLE_THRESHOLD) / scale_factor;
 	let mut carbon = (initial_carbon - FUSION_MOLE_THRESHOLD) / scale_factor;
-	plasma = (plasma - (instability * carbon.sin())).rem_euclid(toroidal_size);
+	plasma = (plasma - instability * carbon.sin()).rem_euclid(toroidal_size);
 	//count the rings. ss13's modulus is positive, this ain't, who knew
 	carbon = (carbon - plasma).rem_euclid(toroidal_size);
 	plasma = plasma * scale_factor + FUSION_MOLE_THRESHOLD;

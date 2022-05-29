@@ -10,30 +10,71 @@ use std::time::{Duration, Instant};
 
 use auxcallback::{byond_callback_sender, process_callbacks_for_millis};
 
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 
-use parking_lot::RwLock;
+use parking_lot::{Once, RwLock};
 
-const PROCESS_NOT_STARTED: u8 = 0;
+use crate::callbacks::process_aux_callbacks;
 
-const PROCESS_PROCESSING: u8 = 1;
+lazy_static::lazy_static! {
+	static ref TURF_CHANNEL: (
+		flume::Sender<Box<SSairInfo>>,
+		flume::Receiver<Box<SSairInfo>>
+	) = flume::bounded(1);
+	static ref HEAT_CHANNEL: (flume::Sender<SSheatInfo>, flume::Receiver<SSheatInfo>) =
+		flume::bounded(1);
+}
 
-const PROCESS_DONE: u8 = 2;
+static INIT_TURF: Once = Once::new();
 
-static PROCESSING_TURF_STEP: AtomicU8 = AtomicU8::new(PROCESS_NOT_STARTED);
+static INIT_HEAT: Once = Once::new();
 
-static WAITING_FOR_THREAD: AtomicBool = AtomicBool::new(false);
+//thread status
+static TASKS_RUNNING: AtomicU8 = AtomicU8::new(0);
+
+#[derive(Copy, Clone)]
+#[allow(unused)]
+struct SSairInfo {
+	fdm_max_steps: i32,
+	equalize_turf_limit: usize,
+	equalize_hard_turf_limit: usize,
+	equalize_enabled: bool,
+	group_pressure_goal: f32,
+	max_x: i32,
+	max_y: i32,
+	planet_enabled: bool,
+}
+
+#[derive(Copy, Clone)]
+struct SSheatInfo {
+	time_delta: f64,
+	max_x: i32,
+	max_y: i32,
+}
+
+fn with_processing_callback_receiver<T>(f: impl Fn(&flume::Receiver<Box<SSairInfo>>) -> T) -> T {
+	f(&TURF_CHANNEL.1)
+}
+
+fn processing_callbacks_sender() -> flume::Sender<Box<SSairInfo>> {
+	TURF_CHANNEL.0.clone()
+}
+
+fn with_heat_processing_callback_receiver<T>(f: impl Fn(&flume::Receiver<SSheatInfo>) -> T) -> T {
+	f(&HEAT_CHANNEL.1)
+}
+
+fn heat_processing_callbacks_sender() -> flume::Sender<SSheatInfo> {
+	HEAT_CHANNEL.0.clone()
+}
 
 #[hook("/datum/controller/subsystem/air/proc/thread_running")]
 fn _thread_running_hook() {
-	Ok(Value::from(
-		PROCESSING_TURF_STEP.load(Ordering::Relaxed) == PROCESS_PROCESSING,
-	))
+	Ok(Value::from(TASKS_RUNNING.load(Ordering::Relaxed) != 0))
 }
 
 #[hook("/datum/controller/subsystem/air/proc/finish_turf_processing_auxtools")]
 fn _finish_process_turfs() {
-	WAITING_FOR_THREAD.store(true, Ordering::SeqCst);
 	let arg_limit = args
 		.get(0)
 		.ok_or_else(|| runtime!("Wrong number of arguments to turf finishing: 0"))?
@@ -47,27 +88,43 @@ fn _finish_process_turfs() {
 			)
 		})?;
 	let processing_callbacks_unfinished = process_callbacks_for_millis(arg_limit as u64);
-	// If PROCESSING_TURF_STEP is done, we're done, and we should set it to NOT_STARTED while we're at it.
-	let processing_turfs_unfinished = PROCESSING_TURF_STEP.compare_exchange(
-		PROCESS_DONE,
-		PROCESS_NOT_STARTED,
-		Ordering::SeqCst,
-		Ordering::Relaxed,
-	) == Err(PROCESS_PROCESSING);
-	if processing_callbacks_unfinished || processing_turfs_unfinished {
+	process_aux_callbacks(crate::callbacks::TURFS);
+	process_aux_callbacks(crate::callbacks::ADJACENCIES);
+	if processing_callbacks_unfinished {
 		Ok(Value::from(true))
 	} else {
-		WAITING_FOR_THREAD.store(false, Ordering::SeqCst);
 		Ok(Value::from(false))
 	}
 }
 
 #[hook("/datum/controller/subsystem/air/proc/process_turfs_auxtools")]
-fn _process_turf_hook() {
-	let resumed = (args
-		.get(0)
-		.ok_or_else(|| runtime!("Wrong number of arguments to turf processing: 0"))?
-		.as_number()
+fn _process_turf_notify() {
+	let sender = processing_callbacks_sender();
+	let fdm_max_steps = src
+		.get_number(byond_string!("share_max_steps"))
+		.unwrap_or(1.0) as i32;
+	let equalize_turf_limit = src
+		.get_number(byond_string!("equalize_turf_limit"))
+		.unwrap_or(100.0) as usize;
+	let equalize_hard_turf_limit = src
+		.get_number(byond_string!("equalize_hard_turf_limit"))
+		.unwrap_or(2000.0) as usize;
+	let equalize_enabled = cfg!(feature = "equalization")
+		&& src
+			.get_number(byond_string!("equalize_enabled"))
+			.map_err(|_| {
+				runtime!(
+					"Attempt to interpret non-number value as number {} {}:{}",
+					std::file!(),
+					std::line!(),
+					std::column!()
+				)
+			})? != 0.0;
+	let group_pressure_goal = src
+		.get_number(byond_string!("excited_group_pressure_goal"))
+		.unwrap_or(0.5);
+	let max_x = auxtools::Value::world()
+		.get_number(byond_string!("maxx"))
 		.map_err(|_| {
 			runtime!(
 				"Attempt to interpret non-number value as number {} {}:{}",
@@ -75,84 +132,57 @@ fn _process_turf_hook() {
 				std::line!(),
 				std::column!()
 			)
-		})? - 1.0)
-		.abs() < f32::EPSILON;
-	#[allow(unused_variables)]
-	if !resumed && PROCESSING_TURF_STEP.load(Ordering::SeqCst) == PROCESS_NOT_STARTED {
-		// Don't want to start it while there's already a thread running, so we only start it if it hasn't been started.
-		let fdm_max_steps = src
-			.get_number(byond_string!("share_max_steps"))
-			.unwrap_or(1.0) as i32;
-		let equalize_turf_limit = src
-			.get_number(byond_string!("equalize_turf_limit"))
-			.map_err(|_| {
-				runtime!(
-					"Attempt to interpret non-number value as number {} {}:{}",
-					std::file!(),
-					std::line!(),
-					std::column!()
-				)
-			})? as usize;
-		let equalize_hard_turf_limit = src
-			.get_number(byond_string!("equalize_hard_turf_limit"))
-			.map_err(|_| {
-				runtime!(
-					"Attempt to interpret non-number value as number {} {}:{}",
-					std::file!(),
-					std::line!(),
-					std::column!()
-				)
-			})? as usize;
-		let equalize_enabled = cfg!(feature = "equalization")
-			&& src
-				.get_number(byond_string!("equalize_enabled"))
-				.map_err(|_| {
-					runtime!(
-						"Attempt to interpret non-number value as number {} {}:{}",
-						std::file!(),
-						std::line!(),
-						std::column!()
-					)
-				})? != 0.0;
-		let group_pressure_goal = src
-			.get_number(byond_string!("excited_group_pressure_goal"))
-			.map_err(|_| {
-				runtime!(
-					"Attempt to interpret non-number value as number {} {}:{}",
-					std::file!(),
-					std::line!(),
-					std::column!()
-				)
-			})?;
-		let max_x = auxtools::Value::world()
-			.get_number(byond_string!("maxx"))
-			.map_err(|_| {
-				runtime!(
-					"Attempt to interpret non-number value as number {} {}:{}",
-					std::file!(),
-					std::line!(),
-					std::column!()
-				)
-			})? as i32;
-		let max_y = auxtools::Value::world()
-			.get_number(byond_string!("maxy"))
-			.map_err(|_| {
-				runtime!(
-					"Attempt to interpret non-number value as number {} {}:{}",
-					std::file!(),
-					std::line!(),
-					std::column!()
-				)
-			})? as i32;
-		rayon::spawn(move || {
-			PROCESSING_TURF_STEP.store(PROCESS_PROCESSING, Ordering::SeqCst);
+		})? as i32;
+	let max_y = auxtools::Value::world()
+		.get_number(byond_string!("maxy"))
+		.map_err(|_| {
+			runtime!(
+				"Attempt to interpret non-number value as number {} {}:{}",
+				std::file!(),
+				std::line!(),
+				std::column!()
+			)
+		})? as i32;
+	let planet_enabled: bool = src
+		.get_number(byond_string!("planet_equalize_enabled"))
+		.unwrap_or(1.0)
+		!= 0.0;
+	process_aux_callbacks(crate::callbacks::TURFS);
+	process_aux_callbacks(crate::callbacks::ADJACENCIES);
+	drop(sender.try_send(Box::new(SSairInfo {
+		fdm_max_steps,
+		equalize_turf_limit,
+		equalize_hard_turf_limit,
+		equalize_enabled,
+		group_pressure_goal,
+		max_x,
+		max_y,
+		planet_enabled,
+	})));
+	Ok(Value::null())
+}
+
+//Fires the task into the thread pool, once
+#[init(full)]
+fn _process_turf_start() -> Result<(), String> {
+	INIT_TURF.call_once(|| {
+		#[allow(unused)]
+		rayon::spawn(|| loop {
+			//this will block until process_turfs is called
+			let info = with_processing_callback_receiver(|receiver| receiver.recv().unwrap());
+			TASKS_RUNNING.fetch_add(1, Ordering::SeqCst);
 			let sender = byond_callback_sender();
 			let (low_pressure_turfs, high_pressure_turfs) = {
 				let start_time = Instant::now();
-				let (low_pressure_turfs, high_pressure_turfs) = fdm(max_x, max_y, fdm_max_steps);
+				let (low_pressure_turfs, high_pressure_turfs) = fdm(
+					info.max_x,
+					info.max_y,
+					info.fdm_max_steps,
+					info.equalize_enabled,
+				);
 				let bench = start_time.elapsed().as_millis();
 				let (lpt, hpt) = (low_pressure_turfs.len(), high_pressure_turfs.len());
-				let _ = sender.try_send(Box::new(move || {
+				drop(sender.try_send(Box::new(move || {
 					let ssair = auxtools::Value::globals().get(byond_string!("SSair"))?;
 					let prev_cost =
 						ssair.get_number(byond_string!("cost_turfs")).map_err(|_| {
@@ -173,19 +203,19 @@ fn _process_turf_hook() {
 						Value::from(hpt as f32),
 					)?;
 					Ok(Value::null())
-				}));
+				})));
 				(low_pressure_turfs, high_pressure_turfs)
 			};
 			{
 				let start_time = Instant::now();
 				let processed_turfs = excited_group_processing(
-					max_x,
-					max_y,
-					group_pressure_goal,
+					info.max_x,
+					info.max_y,
+					info.group_pressure_goal,
 					&low_pressure_turfs,
 				);
 				let bench = start_time.elapsed().as_millis();
-				let _ = sender.try_send(Box::new(move || {
+				drop(sender.try_send(Box::new(move || {
 					let ssair = auxtools::Value::globals().get(byond_string!("SSair"))?;
 					let prev_cost =
 						ssair
@@ -207,29 +237,39 @@ fn _process_turf_hook() {
 						Value::from(processed_turfs as f32),
 					)?;
 					Ok(Value::null())
-				}));
+				})));
 			}
-			if equalize_enabled {
+			if info.equalize_enabled {
 				let start_time = Instant::now();
 				let processed_turfs = {
 					#[cfg(feature = "putnamos")]
 					{
 						super::putnamos::equalize(
-							equalize_turf_limit,
-							equalize_hard_turf_limit,
-							max_x,
-							max_y,
-							high_pressure_turfs,
+							info.equalize_turf_limit,
+							info.equalize_hard_turf_limit,
+							info.max_x,
+							info.max_y,
+							&high_pressure_turfs,
 						)
 					}
 					#[cfg(feature = "monstermos")]
 					{
 						super::monstermos::equalize(
-							equalize_turf_limit,
-							equalize_hard_turf_limit,
-							max_x,
-							max_y,
-							high_pressure_turfs,
+							info.equalize_turf_limit,
+							info.equalize_hard_turf_limit,
+							info.max_x,
+							info.max_y,
+							&high_pressure_turfs,
+							info.planet_enabled,
+						)
+					}
+					#[cfg(feature = "katmos")]
+					{
+						super::katmos::equalize(
+							info.max_x,
+							info.max_y,
+							info.equalize_hard_turf_limit,
+							&high_pressure_turfs,
 						)
 					}
 					#[cfg(not(feature = "equalization"))]
@@ -238,7 +278,7 @@ fn _process_turf_hook() {
 					}
 				};
 				let bench = start_time.elapsed().as_millis();
-				let _ = sender.try_send(Box::new(move || {
+				drop(sender.try_send(Box::new(move || {
 					let ssair = auxtools::Value::globals().get(byond_string!("SSair"))?;
 					let prev_cost =
 						ssair
@@ -260,13 +300,13 @@ fn _process_turf_hook() {
 						Value::from(processed_turfs as f32),
 					)?;
 					Ok(Value::null())
-				}));
+				})));
 			}
 			{
 				let start_time = Instant::now();
 				post_process();
 				let bench = start_time.elapsed().as_millis();
-				let _ = sender.try_send(Box::new(move || {
+				drop(sender.try_send(Box::new(move || {
 					let ssair = auxtools::Value::globals().get(byond_string!("SSair"))?;
 					let prev_cost = ssair
 						.get_number(byond_string!("cost_post_process"))
@@ -283,12 +323,12 @@ fn _process_turf_hook() {
 						Value::from(0.8 * prev_cost + 0.2 * (bench as f32)),
 					)?;
 					Ok(Value::null())
-				}));
+				})));
 			}
-			PROCESSING_TURF_STEP.store(PROCESS_DONE, Ordering::SeqCst);
+			TASKS_RUNNING.fetch_sub(1, Ordering::SeqCst);
 		});
-	}
-	Ok(Value::from(false))
+	});
+	Ok(())
 }
 
 // Compares with neighbors, returning early if any of them are valid.
@@ -311,7 +351,7 @@ fn should_process(m: TurfMixture, all_mixtures: &[RwLock<Mixture>]) -> bool {
 					}
 				}
 				m.planetary_atmos
-					.and_then(|id| planetary_atmos().get(&id))
+					.and_then(|id| planetary_atmos().try_get(&id).try_unwrap())
 					.map_or(false, |planet_atmos_entry| {
 						let planet_atmos = planet_atmos_entry.value();
 						gas.temperature_compare(planet_atmos)
@@ -321,6 +361,8 @@ fn should_process(m: TurfMixture, all_mixtures: &[RwLock<Mixture>]) -> bool {
 }
 
 // Creates the combined gas mixture of all this mix's neighbors, as well as gathering some other pertinent info for future processing.
+// Clippy go away, this type is only used once
+#[allow(clippy::type_complexity)]
 fn process_cell(
 	i: TurfID,
 	m: TurfMixture,
@@ -356,7 +398,10 @@ fn process_cell(
 			None => return None, // this would lead to inconsistencies--no bueno
 		}
 	}
-	if let Some(planet_atmos_entry) = m.planetary_atmos.and_then(|id| planetary_atmos().get(&id)) {
+	if let Some(planet_atmos_entry) = m
+		.planetary_atmos
+		.and_then(|id| planetary_atmos().try_get(&id).try_unwrap())
+	{
 		end_gas.merge(planet_atmos_entry.value());
 		adj_amount += 1;
 	}
@@ -381,45 +426,43 @@ fn process_cell(
 }
 
 // Solving the heat equation using a Finite Difference Method, an iterative stencil loop.
-fn fdm(max_x: i32, max_y: i32, fdm_max_steps: i32) -> (BTreeSet<TurfID>, BTreeSet<TurfID>) {
+fn fdm(
+	max_x: i32,
+	max_y: i32,
+	fdm_max_steps: i32,
+	equalize_enabled: bool,
+) -> (BTreeSet<TurfID>, BTreeSet<TurfID>) {
 	/*
 		This is the replacement system for LINDA. LINDA requires a lot of bookkeeping,
 		which, when coefficient-wise operations are this fast, is all just unnecessary overhead.
 		This is a much simpler FDM system, basically like LINDA but without its most important feature,
 		sleeping turfs, which is why I've renamed it to fdm.
 	*/
-	PROCESSING_TURF_STEP.store(PROCESS_PROCESSING, Ordering::SeqCst);
 	let mut low_pressure_turfs: BTreeSet<TurfID> = BTreeSet::new();
 	let mut high_pressure_turfs: BTreeSet<TurfID> = BTreeSet::new();
 	let mut cur_count = 1;
 	loop {
-		if cur_count > fdm_max_steps || WAITING_FOR_THREAD.load(Ordering::SeqCst) {
+		if cur_count > fdm_max_steps {
 			break;
 		}
 		GasArena::with_all_mixtures(|all_mixtures| {
 			let turfs_to_save = turf_gases()
 				/*
-					This uses the DashMap raw API to access the shards directly.
-					This allows for it to be parallelized much more efficiently
-					with rayon; the speedup gained from this is actually linear
+					This uses DashMap's rayon feature to parallelize the process.
+					The speedup gained from this is actually linear
 					with the amount of cores the CPU has, which, to be frank,
 					is way better than I was expecting, even though this operation
 					is technically embarassingly parallel. It'll probably reach
 					some maximum due to the global turf mixture lock access,
 					but it's already blazingly fast on my i7, so it should be fine.
 				*/
-				.shards()
 				.par_iter()
-				.map(|shard| {
-					shard
-						.read()
-						.iter()
-						.map(|(i, m_v)| (i, *m_v.get()))
-						.filter(|&(_, m)| should_process(m, all_mixtures))
-						.filter_map(|(&i, m)| process_cell(i, m, max_x, max_y, all_mixtures))
-						.collect::<Vec<_>>()
+				.map(|entry| {
+					let (&i, &m) = entry.pair();
+					(i, m)
 				})
-				.flatten()
+				.filter(|&(_, m)| should_process(m, all_mixtures))
+				.filter_map(|(i, m)| process_cell(i, m, max_x, max_y, all_mixtures))
 				.collect::<Vec<_>>();
 			/*
 				For the optimization-heads reading this: this is not an unnecessary collect().
@@ -471,38 +514,41 @@ fn fdm(max_x: i32, max_y: i32, fdm_max_steps: i32) -> (BTreeSet<TurfID>, BTreeSe
 					})
 				})
 				.partition(|&(_, _, max_diff)| max_diff <= 5.0);
-			let pressure_deltas_chunked = high_pressure.par_chunks(20).collect::<Vec<_>>();
-			pressure_deltas_chunked
-				.par_iter()
-				.with_min_len(5)
-				.for_each(|temp_value| {
-					let sender = byond_callback_sender();
-					let these_pressure_deltas = temp_value.iter().copied().collect::<Vec<_>>();
-					let _ = sender.try_send(Box::new(move || {
-						for &(turf_id, pressure_diffs, _) in
-							these_pressure_deltas.iter().filter(|&(id, _, _)| *id != 0)
-						{
-							let turf = unsafe { Value::turf_by_id_unchecked(turf_id) };
-							for &(id, diff) in &pressure_diffs {
-								if id != 0 {
-									let enemy_tile = unsafe { Value::turf_by_id_unchecked(id) };
-									if diff > 5.0 {
-										turf.call(
-											"consider_pressure_difference",
-											&[&enemy_tile, &Value::from(diff)],
-										)?;
-									} else if diff < -5.0 {
-										enemy_tile.call(
-											"consider_pressure_difference",
-											&[&turf.clone(), &Value::from(-diff)],
-										)?;
+			//tossing things around is already handled by katmos, so we don't need to do it here.
+			if !equalize_enabled {
+				let pressure_deltas_chunked = high_pressure.par_chunks(20).collect::<Vec<_>>();
+				pressure_deltas_chunked
+					.par_iter()
+					.with_min_len(5)
+					.for_each(|temp_value| {
+						let sender = byond_callback_sender();
+						let these_pressure_deltas = temp_value.to_vec();
+						drop(sender.try_send(Box::new(move || {
+							for &(turf_id, pressure_diffs, _) in
+								these_pressure_deltas.iter().filter(|&(id, _, _)| *id != 0)
+							{
+								let turf = unsafe { Value::turf_by_id_unchecked(turf_id) };
+								for &(id, diff) in &pressure_diffs {
+									if id != 0 {
+										let enemy_tile = unsafe { Value::turf_by_id_unchecked(id) };
+										if diff > 5.0 {
+											turf.call(
+												"consider_pressure_difference",
+												&[&enemy_tile, &Value::from(diff)],
+											)?;
+										} else if diff < -5.0 {
+											enemy_tile.call(
+												"consider_pressure_difference",
+												&[&turf.clone(), &Value::from(-diff)],
+											)?;
+										}
 									}
 								}
 							}
-						}
-						Ok(Value::null())
-					}));
-				});
+							Ok(Value::null())
+						})));
+					});
+			}
 			high_pressure_turfs.extend(high_pressure.iter().map(|(i, _, _)| i));
 			low_pressure_turfs.extend(low_pressure.iter().map(|(i, _, _)| i));
 		});
@@ -523,22 +569,29 @@ fn excited_group_processing(
 		if found_turfs.contains(&initial_turf) {
 			continue;
 		}
-		if let Some(initial_mix_ref) = turf_gases().get(&initial_turf) {
-			let mut border_turfs: VecDeque<(TurfID, TurfMixture)> = VecDeque::with_capacity(40);
-			let mut turfs: Vec<TurfMixture> = Vec::with_capacity(200);
-			let mut min_pressure = initial_mix_ref.return_pressure();
-			let mut max_pressure = min_pressure;
-			let mut fully_mixed = Mixture::new();
-			border_turfs.push_back((initial_turf, *initial_mix_ref.value()));
-			found_turfs.insert(initial_turf);
-			GasArena::with_all_mixtures(|all_mixtures| {
-				loop {
-					if turfs.len() >= 2500 {
-						break;
-					}
-					if let Some((i, turf)) = border_turfs.pop_front() {
-						let adj_tiles = adjacent_tile_ids(turf.adjacency, i, max_x, max_y);
-						let mix = all_mixtures.get(turf.mix).unwrap().read();
+		let initial_mix_ref = {
+			let maybe_initial_mix_ref = turf_gases().try_get(&initial_turf).try_unwrap();
+			if maybe_initial_mix_ref.is_none() {
+				continue;
+			}
+			*maybe_initial_mix_ref.unwrap()
+		};
+		let mut border_turfs: VecDeque<(TurfID, TurfMixture)> = VecDeque::with_capacity(40);
+		let mut turfs: Vec<TurfMixture> = Vec::with_capacity(200);
+		let mut min_pressure = initial_mix_ref.return_pressure();
+		let mut max_pressure = min_pressure;
+		let mut fully_mixed = Mixture::new();
+		border_turfs.push_back((initial_turf, initial_mix_ref));
+		found_turfs.insert(initial_turf);
+		GasArena::with_all_mixtures(|all_mixtures| {
+			loop {
+				if turfs.len() >= 2500 {
+					break;
+				}
+				if let Some((i, turf)) = border_turfs.pop_front() {
+					let adj_tiles = adjacent_tile_ids(turf.adjacency, i, max_x, max_y);
+					if let Some(lock) = all_mixtures.get(turf.mix) {
+						let mix = lock.read();
 						let pressure = mix.return_pressure();
 						let this_max = max_pressure.max(pressure);
 						let this_min = min_pressure.min(pressure);
@@ -555,27 +608,28 @@ fn excited_group_processing(
 								continue;
 							}
 							found_turfs.insert(loc);
-							if let Some(border_mix) = turf_gases().get(&loc) {
-								if border_mix.simulation_level & SIMULATION_LEVEL_DISABLED
-									!= SIMULATION_LEVEL_DISABLED
-								{
-									border_turfs.push_back((loc, *border_mix));
-								}
+							if let Some(border_mix) = turf_gases()
+								.try_get(&loc)
+								.try_unwrap()
+								.filter(|b| b.enabled())
+							{
+								border_turfs.push_back((loc, *border_mix));
 							}
 						}
-					} else {
-						break;
 					}
+				} else {
+					break;
 				}
-				fully_mixed.multiply(1.0 / turfs.len() as f32);
-				if !fully_mixed.is_corrupt() {
-					turfs.par_iter().for_each(|turf| {
-						let mut mix = all_mixtures.get(turf.mix).unwrap().write();
-						mix.copy_from_mutable(&fully_mixed);
-					});
-				}
-			});
-		}
+			}
+			fully_mixed.multiply(1.0 / turfs.len() as f32);
+			if !fully_mixed.is_corrupt() {
+				turfs.par_iter().with_min_len(125).for_each(|turf| {
+					if let Some(mix_lock) = all_mixtures.get(turf.mix) {
+						mix_lock.write().copy_from_mutable(&fully_mixed);
+					}
+				});
+			}
+		});
 	}
 	found_turfs.len()
 }
@@ -588,19 +642,24 @@ fn remove_trace_planet_gases(
 	planetary_atmos: &'static DashMap<u32, Mixture, FxBuildHasher>,
 	all_mixtures: &[RwLock<Mixture>],
 ) {
-	if let Some(planet_atmos_entry) = m.planetary_atmos.and_then(|id| planetary_atmos.get(&id)) {
+	if let Some(planet_atmos_entry) = m
+		.planetary_atmos
+		.and_then(|id| planetary_atmos.try_get(&id).try_unwrap())
+	{
 		let planet_atmos = planet_atmos_entry.value();
 		if all_mixtures
 			.get(m.mix)
 			.and_then(RwLock::try_read)
 			.map_or(false, |gas| !gas.compare_with(planet_atmos, 0.1))
 		{
-			if let Some(mut gas) = all_mixtures.get(m.mix).unwrap().try_write() {
+			if let Some(mut gas) = all_mixtures.get(m.mix).and_then(RwLock::try_write) {
 				gas.copy_from_mutable(planet_atmos);
 			}
 		}
 	}
 }
+
+static mut VISUALS_CACHE: Option<std::collections::HashMap<usize, u64, FxBuildHasher>> = None;
 
 // Checks if the gas can react or can update visuals, returns None if not.
 fn post_process_cell(
@@ -608,12 +667,21 @@ fn post_process_cell(
 	m: TurfMixture,
 	vis: &[Option<f32>],
 	all_mixtures: &[RwLock<Mixture>],
+	vis_cache: &std::collections::HashMap<usize, u64, FxBuildHasher>,
+	updates: &flume::Sender<(usize, u64)>,
 ) -> Option<(TurfID, bool, bool)> {
 	all_mixtures
 		.get(m.mix)
 		.and_then(RwLock::try_read)
 		.and_then(|gas| {
-			let should_update_visuals = gas.vis_hash_changed(vis);
+			let should_update_visuals =
+				match gas.vis_hash_changed(vis, vis_cache.get(&m.mix).copied().unwrap_or(0)) {
+					Some(hash) => {
+						let _ = updates.send((m.mix, hash));
+						true
+					}
+					None => false,
+				};
 			let reactable = gas.can_react();
 			(should_update_visuals || reactable).then(|| (i, should_update_visuals, reactable))
 		})
@@ -632,98 +700,72 @@ fn post_process() {
 		}
 	};
 	let vis = crate::gas::visibility_copies();
-	turf_gases().shards().par_iter().for_each(|shard| {
+	let (sender, receiver) = flume::unbounded();
+	let vis_cache = unsafe {
+		VISUALS_CACHE
+			.get_or_insert_with(|| std::collections::HashMap::with_hasher(FxBuildHasher::default()))
+	};
+	let processables = {
+		turf_gases()
+			.par_iter()
+			.map(|entry| {
+				let (&i, &m) = entry.pair();
+				(i, m)
+			})
+			.filter_map(|(i, m)| {
+				m.enabled()
+					.then(|| {
+						GasArena::with_all_mixtures(|all_mixtures| {
+							if should_check_planet_turfs {
+								let planetary_atmos = planetary_atmos();
+								remove_trace_planet_gases(m, planetary_atmos, all_mixtures);
+							}
+							post_process_cell(i, m, &vis, all_mixtures, vis_cache, &sender.clone())
+						})
+					})
+					.flatten()
+			})
+			.collect::<Vec<_>>()
+	};
+	processables.into_par_iter().chunks(30).for_each(|chunk| {
 		let sender = byond_callback_sender();
-		let mut reacters = VecDeque::with_capacity(10);
-		let mut visual_updaters = VecDeque::with_capacity(25);
-		GasArena::with_all_mixtures(|all_mixtures| {
-			if should_check_planet_turfs {
-				let planetary_atmos = planetary_atmos();
-				shard
-					.read()
-					.iter()
-					.filter(|(_, m_v)| m_v.get().enabled())
-					.for_each(|(_, m_v)| {
-						remove_trace_planet_gases(*m_v.get(), planetary_atmos, all_mixtures);
-					});
-			}
-			shard
-				.read()
-				.iter()
-				.filter_map(|(&i, m_v)| {
-					let m = m_v.get();
-					m.enabled()
-						.then(|| post_process_cell(i, *m, &vis, all_mixtures))
-						.flatten()
-				})
-				.for_each(|(i, should_update_visuals, reactable)| {
-					if should_update_visuals {
-						visual_updaters.push_back(i);
-						if visual_updaters.len() >= 25 {
-							let copy = visual_updaters.drain(..).collect::<Vec<_>>();
-							let _ = sender.try_send(Box::new(move || {
-								for &i in &copy {
-									let turf = unsafe { Value::turf_by_id_unchecked(i) };
-									turf.call("update_visuals", &[])?;
-								}
-								Ok(Value::null())
-							}));
-						}
-					}
-					if reactable {
-						reacters.push_back(i);
-						if reacters.len() >= 10 {
-							let copy = reacters.drain(..).collect::<Vec<_>>();
-							let _ = sender.try_send(Box::new(move || {
-								for &i in &copy {
-									let turf = unsafe { Value::turf_by_id_unchecked(i) };
-									if cfg!(target_os = "linux") {
-										turf.get(byond_string!("air"))?
-											.call("vv_react", &[&turf])?;
-									} else {
-										turf.get(byond_string!("air"))?.call("react", &[&turf])?;
-									}
-								}
-								Ok(Value::null())
-							}));
-						}
-					}
-				});
-		});
-		let _ = sender.try_send(Box::new(move || {
-			for &i in &reacters {
+		drop(sender.try_send(Box::new(move || {
+			for (i, should_update_vis, should_react) in chunk.clone() {
 				let turf = unsafe { Value::turf_by_id_unchecked(i) };
-				if cfg!(target_os = "linux") {
-					turf.get(byond_string!("air"))?.call("vv_react", &[&turf])?;
-				} else {
-					turf.get(byond_string!("air"))?.call("react", &[&turf])?;
+				if should_react {
+					if cfg!(target_os = "linux") {
+						turf.get(byond_string!("air"))?.call("vv_react", &[&turf])?;
+					} else {
+						turf.get(byond_string!("air"))?.call("react", &[&turf])?;
+					}
+				}
+				if should_update_vis {
+					//turf.call("update_visuals", &[])?;
+					update_visuals(&turf)?;
 				}
 			}
-			for &i in &visual_updaters {
-				let turf = unsafe { Value::turf_by_id_unchecked(i) };
-				turf.call("update_visuals", &[])?;
-			}
 			Ok(Value::null())
-		}));
+		})));
 	});
+	for (k, v) in receiver.drain() {
+		vis_cache.insert(k, v);
+	}
 }
 
 static HEAT_PROCESS_TIME: AtomicU64 = AtomicU64::new(1_000_000);
 
 #[hook("/datum/controller/subsystem/air/proc/heat_process_time")]
 fn _process_heat_time() {
-	let tot = HEAT_PROCESS_TIME.load(Ordering::SeqCst);
+	let tot = HEAT_PROCESS_TIME.load(Ordering::Relaxed);
 	Ok(Value::from(
 		Duration::new(tot / 1_000_000_000, (tot % 1_000_000_000) as u32).as_millis() as f32,
 	))
 }
 
-static PROCESSING_HEAT: AtomicBool = AtomicBool::new(false);
-
 // Expected function call: process_turf_heat()
 // Returns: TRUE if thread not done, FALSE otherwise
 #[hook("/datum/controller/subsystem/air/proc/process_turf_heat")]
-fn _process_heat_hook() {
+fn _process_heat_notify() {
 	/*
 		Replacing LINDA's superconductivity system is this much more brute-force
 		system--it shares heat between turfs and their neighbors,
@@ -731,137 +773,142 @@ fn _process_heat_hook() {
 		between turfs and their gases. Since the latter requires a write lock,
 		it's done after the previous step. This one doesn't care about
 		consistency like the processing step does--this can run in full parallel.
+
+		Can't get a number from src in the thread, so we get it here.
+		Have to get the time delta because the radiation
+		is actually physics-based--the stefan boltzmann constant
+		and radiation from space both have dimensions of second^-1 that
+		need to be multiplied out to have any physical meaning.
+		They also have dimensions of meter^-2, but I'm assuming
+		turf tiles are 1 meter^2 anyway--the atmos subsystem
+		does this in general, thus turf gas mixtures being 2.5 m^3.
 	*/
-	if PROCESSING_HEAT.compare_exchange(false, true, Ordering::SeqCst, Ordering::Relaxed)
-		== Ok(false)
-	{
-		/*
-			Can't get a number from src in the thread, so we get it here.
-			Have to get the time delta because the radiation
-			is actually physics-based--the stefan boltzmann constant
-			and radiation from space both have dimensions of second^-1 that
-			need to be multiplied out to have any physical meaning.
-			They also have dimensions of meter^-2, but I'm assuming
-			turf tiles are 1 meter^2 anyway--the atmos subsystem
-			does this in general, thus turf gas mixtures being 2.5 m^3.
-		*/
-		let time_delta = (src.get_number(byond_string!("wait")).map_err(|_| {
+	let sender = heat_processing_callbacks_sender();
+	let time_delta = (src.get_number(byond_string!("wait")).map_err(|_| {
+		runtime!(
+			"Attempt to interpret non-number value as number {} {}:{}",
+			std::file!(),
+			std::line!(),
+			std::column!()
+		)
+	})? / 10.0) as f64;
+	let max_x = auxtools::Value::world()
+		.get_number(byond_string!("maxx"))
+		.map_err(|_| {
 			runtime!(
 				"Attempt to interpret non-number value as number {} {}:{}",
 				std::file!(),
 				std::line!(),
 				std::column!()
 			)
-		})? / 10.0) as f64;
-		let max_x = auxtools::Value::world()
-			.get_number(byond_string!("maxx"))
-			.map_err(|_| {
-				runtime!(
-					"Attempt to interpret non-number value as number {} {}:{}",
-					std::file!(),
-					std::line!(),
-					std::column!()
-				)
-			})? as i32;
-		let max_y = auxtools::Value::world()
-			.get_number(byond_string!("maxy"))
-			.map_err(|_| {
-				runtime!(
-					"Attempt to interpret non-number value as number {} {}:{}",
-					std::file!(),
-					std::line!(),
-					std::column!()
-				)
-			})? as i32;
-		rayon::spawn(move || {
+		})? as i32;
+	let max_y = auxtools::Value::world()
+		.get_number(byond_string!("maxy"))
+		.map_err(|_| {
+			runtime!(
+				"Attempt to interpret non-number value as number {} {}:{}",
+				std::file!(),
+				std::line!(),
+				std::column!()
+			)
+		})? as i32;
+	process_aux_callbacks(crate::callbacks::TEMPERATURE);
+	let _ = sender.try_send(SSheatInfo {
+		time_delta,
+		max_x,
+		max_y,
+	});
+	Ok(Value::null())
+}
+
+//Fires the task into the thread pool, once
+#[init(full)]
+fn _process_heat_start() -> Result<(), String> {
+	INIT_HEAT.call_once(|| {
+		rayon::spawn(|| loop {
+			//this will block until process_turf_heat is called
+			let info = with_heat_processing_callback_receiver(|receiver| receiver.recv().unwrap());
+			TASKS_RUNNING.fetch_add(1, Ordering::SeqCst);
 			let start_time = Instant::now();
 			let sender = byond_callback_sender();
-			let emissivity_constant: f64 = STEFAN_BOLTZMANN_CONSTANT * time_delta;
-			let radiation_from_space_tick: f64 = RADIATION_FROM_SPACE * time_delta;
+			let emissivity_constant: f64 = STEFAN_BOLTZMANN_CONSTANT * info.time_delta;
+			let radiation_from_space_tick: f64 = RADIATION_FROM_SPACE * info.time_delta;
 			let temps_to_update = turf_temperatures()
-				/*
-					Same weird shard trick as above.
-				*/
-				.shards()
 				.par_iter()
-				.map(|shard| {
-					shard
-						.read()
-						.iter()
-						.filter_map(|(&i, t_v)| {
-							let t = *t_v.get();
-							let adj = t.adjacency;
-							/*
-								If it has no thermal conductivity or low thermal capacity,
-								then it's not gonna interact, or at least shouldn't.
-							*/
-							if t.thermal_conductivity > 0.0 && t.heat_capacity > 300.0 && adj > 0 {
-								let mut heat_delta = 0.0;
-								let is_temp_delta_with_air = turf_gases()
-									.get(&i)
-									.filter(|m| m.simulation_level & SIMULATION_LEVEL_ANY > 0)
-									.and_then(|m| {
-										GasArena::with_all_mixtures(|all_mixtures| {
-											all_mixtures.get(m.mix).and_then(RwLock::try_read).map(
-												|gas| (t.temperature - gas.get_temperature() > 1.0),
-											)
-										})
+				.map(|entry| {
+					let (&i, &t) = entry.pair();
+					(i, t)
+				})
+				.filter_map(|(i, t)| {
+					let adj = t.adjacency;
+					/*
+						If it has no thermal conductivity or low thermal capacity,
+						then it's not gonna interact, or at least shouldn't.
+					*/
+					(t.thermal_conductivity > 0.0 && t.heat_capacity > 0.0 && adj > 0)
+						.then(|| {
+							let mut heat_delta = 0.0;
+							let is_temp_delta_with_air = turf_gases()
+								.try_get(&i)
+								.try_unwrap()
+								.filter(|m| m.enabled())
+								.and_then(|m| {
+									GasArena::with_all_mixtures(|all_mixtures| {
+										all_mixtures.get(m.mix).and_then(RwLock::try_read).map(
+											|gas| (t.temperature - gas.get_temperature() > 1.0),
+										)
 									})
-									.unwrap_or(false);
-								for (_, loc) in adjacent_tile_ids(adj, i, max_x, max_y) {
-									if let Some(other) = turf_temperatures().get(&loc) {
-										heat_delta +=
-											t.thermal_conductivity.min(other.thermal_conductivity)
-												* (other.temperature - t.temperature) * (t
-												.heat_capacity
-												* other.heat_capacity
-												/ (t.heat_capacity + other.heat_capacity));
+								})
+								.unwrap_or(false);
+							for (_, loc) in adjacent_tile_ids(adj, i, info.max_x, info.max_y) {
+								heat_delta += turf_temperatures()
+									.try_get(&loc)
+									.try_unwrap()
+									.map_or(0.0, |other| {
 										/*
-											The horrible line above is essentially
+											The horrible line below is essentially
 											sharing between solids--making it the minimum of both
 											conductivities makes this consistent, funnily enough.
 										*/
-									}
-								}
-								if t.adjacent_to_space {
-									/*
-										Straight up the standard blackbody radiation
-										equation. All these are f64s because
-										f32::MAX^4 < f64::MAX^(1/4), and t.temperature
-										is ordinarily an f32, meaning that
-										this will never go into infinities.
-									*/
-									let blackbody_radiation: f64 = (emissivity_constant
-										* ((t.temperature as f64).powi(4)))
-										- radiation_from_space_tick;
-									heat_delta -= blackbody_radiation as f32;
-								}
-								let temp_delta = heat_delta / t.heat_capacity;
-								if is_temp_delta_with_air || temp_delta.abs() > 0.1 {
-									Some((i, t.temperature + temp_delta))
-								} else {
-									None
-								}
-							} else {
-								None
+										t.thermal_conductivity.min(other.thermal_conductivity)
+											* (other.temperature - t.temperature) * (t.heat_capacity
+											* other.heat_capacity
+											/ (t.heat_capacity + other.heat_capacity))
+									});
 							}
+							if t.adjacent_to_space {
+								/*
+									Straight up the standard blackbody radiation
+									equation. All these are f64s because
+									f32::MAX^4 < f64::MAX, and t.temperature
+									is ordinarily an f32, meaning that
+									this will never go into infinities.
+								*/
+								let blackbody_radiation: f64 = (emissivity_constant
+									* (f64::from(t.temperature).powi(4)))
+									- radiation_from_space_tick;
+								heat_delta -= blackbody_radiation as f32;
+							}
+							let temp_delta = heat_delta / t.heat_capacity;
+							(is_temp_delta_with_air || temp_delta.abs() > 0.01)
+								.then(|| (i, t.temperature + temp_delta))
 						})
-						.collect::<Vec<_>>()
+						.flatten()
 				})
-				.flatten()
-				.collect::<Vec<_>>(); // for consistency, unfortunately
+				.collect::<Vec<_>>();
 			temps_to_update
 				.par_iter()
 				.with_min_len(100)
 				.for_each(|&(i, new_temp)| {
-					let t: &mut ThermalInfo = &mut turf_temperatures().get_mut(&i).unwrap();
+					let maybe_t = turf_temperatures().try_get_mut(&i).try_unwrap();
+					if maybe_t.is_none() {
+						return;
+					}
+					let t: &mut ThermalInfo = &mut maybe_t.unwrap();
 					t.temperature = turf_gases()
-						.get(&i)
-						.filter(|m| {
-							m.simulation_level != SIMULATION_LEVEL_NONE
-								&& m.simulation_level & SIMULATION_LEVEL_DISABLED
-									!= SIMULATION_LEVEL_DISABLED
-						})
+						.try_get(&i)
+						.try_unwrap()
+						.filter(|m| m.enabled())
 						.and_then(|m| {
 							GasArena::with_all_mixtures(|all_mixtures| {
 								all_mixtures.get(m.mix).map(|entry| {
@@ -888,39 +935,26 @@ fn _process_heat_hook() {
 						&& t.temperature > t.heat_capacity
 					{
 						// not what heat capacity means but whatever
-						let _ = sender.try_send(Box::new(move || {
+						drop(sender.try_send(Box::new(move || {
 							let turf = unsafe { Value::turf_by_id_unchecked(i) };
 							turf.set(byond_string!("to_be_destroyed"), 1.0)?;
 							Ok(Value::null())
-						}));
+						})));
 					}
 				});
-			PROCESSING_HEAT.store(false, Ordering::SeqCst);
 			//Alright, now how much time did that take?
 			let bench = start_time.elapsed().as_nanos();
 			let old_bench = HEAT_PROCESS_TIME.load(Ordering::SeqCst);
 			// We display this as part of the MC atmospherics stuff.
 			HEAT_PROCESS_TIME.store((old_bench * 3 + (bench * 7) as u64) / 10, Ordering::SeqCst);
+			TASKS_RUNNING.fetch_sub(1, Ordering::SeqCst);
 		});
-	}
-	let arg_limit = args
-		.get(0)
-		.ok_or_else(|| runtime!("Wrong number of arguments to heat processing: 0"))?
-		.as_number()
-		.map_err(|_| {
-			runtime!(
-				"Attempt to interpret non-number value as number {} {}:{}",
-				std::file!(),
-				std::line!(),
-				std::column!()
-			)
-		})?;
-	Ok(Value::from(process_callbacks_for_millis(arg_limit as u64)))
+	});
+	Ok(())
 }
 
 #[shutdown]
 fn reset_auxmos_processing() {
-	PROCESSING_TURF_STEP.store(PROCESS_NOT_STARTED, Ordering::SeqCst);
-	PROCESSING_HEAT.store(false, Ordering::SeqCst);
-	HEAT_PROCESS_TIME.store(1_000_000, Ordering::SeqCst);
+	unsafe { VISUALS_CACHE = None };
+	HEAT_PROCESS_TIME.store(1_000_000, Ordering::Relaxed);
 }

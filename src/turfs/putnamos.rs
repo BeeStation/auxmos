@@ -44,12 +44,13 @@ fn explosively_depressurize(
 					"consider_firelocks",
 					&[&unsafe { Value::turf_by_id_unchecked(loc) }],
 				)?;
-				let new_m = turf_gases().get(&i).unwrap();
-				let bit = 1 << j;
-				if new_m.adjacency & bit == bit {
-					if let Some(adj) = turf_gases().get(&loc) {
-						let (&adj_i, &adj_m) = (adj.key(), adj.value());
-						turfs.push((adj_i, adj_m));
+				if let Some(new_m) = turf_gases().get(&i) {
+					let bit = 1 << j;
+					if new_m.adjacency & bit == bit {
+						if let Some(adj) = turf_gases().get(&loc) {
+							let (&adj_i, &adj_m) = (adj.key(), adj.value());
+							turfs.push((adj_i, adj_m));
+						}
 					}
 				}
 			}
@@ -132,13 +133,15 @@ fn explosively_depressurize(
 
 // Just floodfills to lower-pressure turfs until it can't find any more.
 
-#[deprecated(note = "Prefer monstermos.")]
+#[deprecated(
+	note = "Katmos should be used intead of Monstermos or Putnamos, as that one is actively maintained."
+)]
 pub fn equalize(
 	equalize_turf_limit: usize,
 	equalize_hard_turf_limit: usize,
 	max_x: i32,
 	max_y: i32,
-	high_pressure_turfs: BTreeSet<TurfID>,
+	high_pressure_turfs: &BTreeSet<TurfID>,
 ) -> usize {
 	let sender = byond_callback_sender();
 	let mut turfs_processed = 0;
@@ -153,7 +156,7 @@ pub fn equalize(
 			merger.clear_with_vol(0.0);
 			border_turfs.push_back((initial_idx, *initial_turf, initial_idx, 0.0));
 			found_turfs.insert(initial_idx);
-			if GasMixtures::with_all_mixtures(|all_mixtures| {
+			if GasArena::with_all_mixtures(|all_mixtures| {
 				// floodfill
 				while !border_turfs.is_empty() && turfs.len() < equalize_turf_limit {
 					let (cur_idx, cur_turf, parent_turf, pressure_delta) =
@@ -209,7 +212,7 @@ pub fn equalize(
 			}
 			merger.multiply(1.0 / turfs.len() as f32);
 			turfs_processed += turfs.len();
-			let to_send = GasMixtures::with_all_mixtures(|all_mixtures| {
+			let to_send = GasArena::with_all_mixtures(|all_mixtures| {
 				turfs
 					.par_iter()
 					.with_min_len(50)

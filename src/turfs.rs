@@ -6,6 +6,9 @@ pub mod monstermos;
 #[cfg(feature = "putnamos")]
 pub mod putnamos;
 
+#[cfg(feature = "katmos")]
+pub mod katmos;
+
 use crate::gas::Mixture;
 
 use auxtools::*;
@@ -21,6 +24,10 @@ use fxhash::FxBuildHasher;
 use rayon;
 
 use rayon::prelude::*;
+
+use std::mem::drop;
+
+use crate::callbacks::aux_callbacks_sender;
 
 const NORTH: u8 = 1;
 const SOUTH: u8 = 2;
@@ -41,6 +48,13 @@ const fn adj_flag_to_idx(adj_flag: u8) -> usize {
 	}
 }
 
+pub const NONE: u8 = 0;
+pub const SIMULATION_DIFFUSE: u8 = 1;
+pub const SIMULATION_ALL: u8 = 2;
+pub const SIMULATION_ANY: u8 = SIMULATION_DIFFUSE | SIMULATION_ALL;
+pub const SIMULATION_DISABLED: u8 = 4;
+pub const SIMULATION_FLAGS: u8 = SIMULATION_ANY | SIMULATION_DISABLED;
+
 type TurfID = u32;
 
 // TurfMixture can be treated as "immutable" for all intents and purposes--put other data somewhere else
@@ -48,7 +62,7 @@ type TurfID = u32;
 struct TurfMixture {
 	pub mix: usize,
 	pub adjacency: u8,
-	pub simulation_level: u8,
+	pub flags: u8,
 	pub planetary_atmos: Option<u32>,
 	pub adjacents: [Option<nonmax::NonMaxUsize>; 6], // this baby saves us 50% of the cpu time in FDM calcs
 }
@@ -56,8 +70,8 @@ struct TurfMixture {
 #[allow(dead_code)]
 impl TurfMixture {
 	pub fn enabled(&self) -> bool {
-		self.simulation_level > 0
-			&& self.simulation_level & SIMULATION_LEVEL_DISABLED != SIMULATION_LEVEL_DISABLED
+		let simul_flags = self.flags & SIMULATION_FLAGS;
+		simul_flags & SIMULATION_DISABLED == 0 && simul_flags & SIMULATION_ANY != 0
 	}
 	pub fn adjacent_mixes<'a>(
 		&'a self,
@@ -190,8 +204,13 @@ fn _hook_register_turf() {
 			std::column!()
 		)
 	})?;
+	let sender = aux_callbacks_sender(crate::callbacks::TURFS);
 	if simulation_level < 0.0 {
-		turf_gases().remove(&unsafe { src.raw.data.id });
+		let id = unsafe { src.raw.data.id };
+		drop(sender.send(Box::new(move || {
+			turf_gases().remove(&id);
+			Ok(Value::null())
+		})));
 		Ok(Value::null())
 	} else {
 		let mut to_insert: TurfMixture = TurfMixture::default();
@@ -207,7 +226,7 @@ fn _hook_register_turf() {
 				)
 			})?
 			.to_bits() as usize;
-		to_insert.simulation_level = args[0].as_number().map_err(|_| {
+		to_insert.flags = args[0].as_number().map_err(|_| {
 			runtime!(
 				"Attempt to interpret non-number value as number {} {}:{}",
 				std::file!(),
@@ -231,13 +250,18 @@ fn _hook_register_turf() {
 			}
 		}
 		let id = unsafe { src.raw.data.id };
-		turf_gases().insert(id, to_insert);
+		drop(sender.send(Box::new(move || {
+			turf_gases().insert(id, to_insert);
+			Ok(Value::null())
+		})));
 		Ok(Value::null())
 	}
 }
 
 #[hook("/turf/proc/__auxtools_update_turf_temp_info")]
 fn _hook_turf_update_temp() {
+	let sender = aux_callbacks_sender(crate::callbacks::TEMPERATURE);
+	let id = unsafe { src.raw.data.id };
 	if src
 		.get_number(byond_string!("thermal_conductivity"))
 		.unwrap_or_default()
@@ -246,16 +270,14 @@ fn _hook_turf_update_temp() {
 		.unwrap_or_default()
 		> 0.0
 	{
-		let mut entry = turf_temperatures()
-			.entry(unsafe { src.raw.data.id })
-			.or_insert_with(|| ThermalInfo {
-				temperature: 293.15,
-				thermal_conductivity: 0.0,
-				heat_capacity: 0.0,
-				adjacency: NORTH | SOUTH | WEST | EAST,
-				adjacent_to_space: false,
-			});
-		entry.thermal_conductivity = src
+		let mut to_insert = ThermalInfo {
+			temperature: 293.15,
+			thermal_conductivity: 0.0,
+			heat_capacity: 0.0,
+			adjacency: NORTH | SOUTH | WEST | EAST,
+			adjacent_to_space: false,
+		};
+		to_insert.thermal_conductivity = src
 			.get_number(byond_string!("thermal_conductivity"))
 			.map_err(|_| {
 				runtime!(
@@ -265,7 +287,7 @@ fn _hook_turf_update_temp() {
 					std::column!()
 				)
 			})?;
-		entry.heat_capacity = src
+		to_insert.heat_capacity = src
 			.get_number(byond_string!("heat_capacity"))
 			.map_err(|_| {
 				runtime!(
@@ -275,8 +297,8 @@ fn _hook_turf_update_temp() {
 					std::column!()
 				)
 			})?;
-		entry.adjacency = NORTH | SOUTH | WEST | EAST;
-		entry.adjacent_to_space = args[0].as_number().map_err(|_| {
+		to_insert.adjacency = NORTH | SOUTH | WEST | EAST;
+		to_insert.adjacent_to_space = args[0].as_number().map_err(|_| {
 			runtime!(
 				"Attempt to interpret non-number value as number {} {}:{}",
 				std::file!(),
@@ -284,7 +306,7 @@ fn _hook_turf_update_temp() {
 				std::column!()
 			)
 		})? != 0.0;
-		entry.temperature = src
+		to_insert.temperature = src
 			.get_number(byond_string!("initial_temperature"))
 			.map_err(|_| {
 				runtime!(
@@ -294,8 +316,15 @@ fn _hook_turf_update_temp() {
 					std::column!()
 				)
 			})?;
+		drop(sender.send(Box::new(move || {
+			turf_temperatures().insert(id, to_insert);
+			Ok(Value::null())
+		})));
 	} else {
-		turf_temperatures().remove(&unsafe { src.raw.data.id });
+		drop(sender.send(Box::new(move || {
+			turf_temperatures().remove(&id);
+			Ok(Value::null())
+		})));
 	}
 	Ok(Value::null())
 }
@@ -315,69 +344,87 @@ fn _hook_sleep() {
 	} else {
 		0.0
 	};
+	let src_id = unsafe { src.raw.data.id };
 	if arg == 0.0 {
-		turf_gases()
-			.entry(unsafe { src.raw.data.id })
-			.and_modify(|turf| {
-				turf.simulation_level &= !SIMULATION_LEVEL_DISABLED;
-			});
+		turf_gases().entry(src_id).and_modify(|turf| {
+			turf.flags &= !SIMULATION_DISABLED;
+		});
 	} else {
-		turf_gases()
-			.entry(unsafe { src.raw.data.id })
-			.and_modify(|turf| {
-				turf.simulation_level |= SIMULATION_LEVEL_DISABLED;
-			});
+		turf_gases().entry(src_id).and_modify(|turf| {
+			turf.flags |= SIMULATION_DISABLED;
+		});
 	}
 	Ok(Value::from(true))
 }
-
 #[hook("/turf/proc/__update_auxtools_turf_adjacency_info")]
-fn _hook_adjacent_turfs() {
-	if let Ok(adjacent_list) = src.get_list(byond_string!("atmos_adjacent_turfs")) {
-		let mut adjacent_mixes: [Option<nonmax::NonMaxUsize>; 6] = [None; 6];
-		let mut adjacency = 0;
-		for i in 1..=adjacent_list.len() {
-			let adj_val = adjacent_list.get(i)?;
-			let adjacent_num = adjacent_list.get(&adj_val)?.as_number()? as u8;
-			adjacency |= adjacent_num;
-			adjacent_mixes[adj_flag_to_idx(adjacent_num)] = turf_gases()
-				.get(&unsafe { adj_val.raw.data.id })
-				.and_then(|t| nonmax::NonMaxUsize::new(t.mix));
-		}
-		turf_gases()
-			.entry(unsafe { src.raw.data.id })
-			.and_modify(|turf| {
+fn _hook_infos(arg0: Value, arg1: Value) {
+	let update_now = arg1.as_number().unwrap_or(0.0) != 0.0;
+	let adjacent_to_spess = arg0.as_number().unwrap_or(0.0) != 0.0;
+	let id = unsafe { src.raw.data.id };
+	let sender = aux_callbacks_sender(crate::callbacks::ADJACENCIES);
+	let boxed_fn: Box<dyn Fn() -> DMResult + Send + Sync> = Box::new(move || {
+		let src_turf = unsafe { Value::turf_by_id_unchecked(id) };
+		if let Ok(adjacent_list) = src_turf.get_list(byond_string!("atmos_adjacent_turfs")) {
+			let mut adjacent_mixes: [Option<nonmax::NonMaxUsize>; 6] = [None; 6];
+			let mut adjacency = 0;
+			for i in 1..=adjacent_list.len() {
+				let adj_val = adjacent_list.get(i)?;
+				let adjacent_num = adjacent_list.get(&adj_val)?.as_number()? as u8;
+				adjacency |= adjacent_num;
+				adjacent_mixes[adj_flag_to_idx(adjacent_num)] = turf_gases()
+					.get(&unsafe { adj_val.raw.data.id })
+					.and_then(|t| nonmax::NonMaxUsize::new(t.mix));
+			}
+			turf_gases().entry(id).and_modify(|turf| {
 				turf.adjacency = adjacency;
 				turf.adjacents = adjacent_mixes;
 			});
-	} else {
-		turf_gases()
-			.entry(unsafe { src.raw.data.id })
-			.and_modify(|turf| {
+		} else {
+			turf_gases().entry(id).and_modify(|turf| {
 				turf.adjacency = 0;
 				turf.adjacents = [None; 6];
 			});
-	}
-	if let Ok(atmos_blocked_directions) =
-		src.get_number(byond_string!("conductivity_blocked_directions"))
-	{
-		let adjacency = NORTH | SOUTH | WEST | EAST & !(atmos_blocked_directions as u8);
-		turf_temperatures()
-			.entry(unsafe { src.raw.data.id })
-			.and_modify(|entry| {
-				entry.adjacency = adjacency;
-			})
-			.or_insert_with(|| ThermalInfo {
-				temperature: src
-					.get_number(byond_string!("initial_temperature"))
-					.unwrap(),
-				thermal_conductivity: src
-					.get_number(byond_string!("thermal_conductivity"))
-					.unwrap(),
-				heat_capacity: src.get_number(byond_string!("heat_capacity")).unwrap(),
-				adjacency,
-				adjacent_to_space: args[0].as_number().unwrap() != 0.0,
-			});
+		}
+		if let Ok(blocks_air) = src_turf.get_number(byond_string!("blocks_air")) {
+			if blocks_air == 0.0 {
+				turf_gases().entry(id).and_modify(|turf| {
+					turf.flags &= !SIMULATION_DISABLED;
+				});
+			} else {
+				turf_gases().entry(id).and_modify(|turf| {
+					turf.flags |= SIMULATION_DISABLED;
+				});
+			}
+		}
+		if let Ok(atmos_blocked_directions) =
+			src_turf.get_number(byond_string!("conductivity_blocked_directions"))
+		{
+			let adjacency = NORTH | SOUTH | WEST | EAST & !(atmos_blocked_directions as u8);
+			turf_temperatures()
+				.entry(id)
+				.and_modify(|entry| {
+					entry.adjacency = adjacency;
+				})
+				.or_insert_with(|| ThermalInfo {
+					temperature: src_turf
+						.get_number(byond_string!("initial_temperature"))
+						.unwrap_or(TCMB),
+					thermal_conductivity: src_turf
+						.get_number(byond_string!("thermal_conductivity"))
+						.unwrap_or(0.0),
+					heat_capacity: src_turf
+						.get_number(byond_string!("heat_capacity"))
+						.unwrap_or(0.0),
+					adjacency,
+					adjacent_to_space: adjacent_to_spess,
+				});
+		}
+		Ok(Value::null())
+	});
+	if update_now {
+		boxed_fn()?;
+	} else {
+		drop(sender.send(boxed_fn));
 	}
 	Ok(Value::null())
 }
@@ -394,100 +441,55 @@ fn _hook_turf_temperature() {
 		src.get(byond_string!("initial_temperature"))
 	}
 }
-
-#[hook("/turf/proc/set_temperature")]
-fn _hook_set_temperature() {
-	let argument = args
-		.get(0)
-		.ok_or_else(|| runtime!("Invalid argument count to turf temperature set: 0"))?
-		.as_number()
-		.map_err(|_| {
-			runtime!(
-				"Attempt to interpret non-number value as number {} {}:{}",
-				std::file!(),
-				std::line!(),
-				std::column!()
-			)
-		})?;
-	turf_temperatures()
-		.entry(unsafe { src.raw.data.id })
-		.and_modify(|turf| {
-			turf.temperature = argument;
-		})
-		.or_insert_with(|| ThermalInfo {
-			temperature: argument,
-			thermal_conductivity: src
-				.get_number(byond_string!("thermal_conductivity"))
-				.unwrap(),
-			heat_capacity: src.get_number(byond_string!("heat_capacity")).unwrap(),
-			adjacency: 0,
-			adjacent_to_space: false,
-		});
-	Ok(Value::null())
-}
-
-/*Miserable performance, I mean seriously terrible, 1000x worse than in byond, why?
-#[hook("/turf/open/proc/update_visuals")]
-fn _hook_update_visuals() {
+// gas_overlays: list( GAS_ID = list( VIS_FACTORS = OVERLAYS )) got it? I don't
+/// Updates the visual overlays for the given turf.
+/// Will use a cached overlay list if one exists.
+/// # Errors
+/// If auxgm wasn't implemented properly or there's an invalid gas mixture.
+pub fn update_visuals(src: &Value) -> DMResult {
 	use super::gas;
-	let old_overlay_types_value = src.get(byond_string!("atmos_overlay_types"))?;
-	let mut overlay_types: Vec<Value> = Vec::new();
-	let gas_overlays = src.get_global("meta_gas_overlays")?.as_list()?;
-	GasMixtures::with_all_mixtures(|all_mixtures| {
-		all_mixtures
-			.get(
-				TURF_GASES
-					.get(&unsafe { src.raw.data.id })
-					.unwrap()
-					.mix,
-			)
-			.unwrap()
-			.read()
-			.for_each_gas(|(i, &n)| {
-				if let Some(amt) = gas::gas_visibility(i) {
-					if n > amt {
-						if let Ok(this_gas_overlays_v) =
-							gas_overlays.get(gas::gas_idx_to_id(i).unwrap().as_ref())
-						{
-							if let Ok(this_gas_overlays) = this_gas_overlays_v.as_list() {
-								let this_idx = FACTOR_GAS_VISIBLE_MAX
-									.min((n / MOLES_GAS_VISIBLE_STEP).ceil()) as u32;
-								if let Ok(this_gas_overlay) = this_gas_overlays.get(this_idx + 1) {
-									overlay_types.push(this_gas_overlay);
-								}
+	match src.get(byond_string!("air")) {
+		Err(_) => Ok(Value::null()),
+		Ok(air) => {
+			let overlay_types = List::new();
+			let gas_overlays = Value::globals()
+				.get(byond_string!("gas_data"))?
+				.get_list(byond_string!("overlays"))?;
+			let ptr = air
+				.get_number(byond_string!("_extools_pointer_gasmixture"))
+				.map_err(|_| {
+					runtime!(
+						"Attempt to interpret non-number value as number {} {}:{}",
+						std::file!(),
+						std::line!(),
+						std::column!()
+					)
+				})?
+				.to_bits() as usize;
+			GasArena::with_gas_mixture(ptr, |mix| {
+				mix.for_each_gas(|idx, moles| {
+					if let Some(amt) = gas::types::gas_visibility(idx) {
+						if moles > amt {
+							let this_overlay_list =
+								gas_overlays.get(gas::gas_idx_to_id(idx)?)?.as_list()?;
+							if let Ok(this_gas_overlay) = this_overlay_list.get(
+								(moles / MOLES_GAS_VISIBLE_STEP)
+									.ceil()
+									.min(FACTOR_GAS_VISIBLE_MAX)
+									.max(1.0) as u32,
+							) {
+								overlay_types.append(this_gas_overlay);
 							}
 						}
 					}
-				}
-			});
-	});
-	if overlay_types.is_empty() {
-		return Ok(Value::null());
-	}
-	if let Ok(old_overlay_types) = old_overlay_types_value.as_list() {
-		if old_overlay_types.len() as usize == overlay_types.len() {
-			if overlay_types.iter().enumerate().all(|(i, v)| {
-				let v1 = v.raw;
-				let v2 = old_overlay_types.get((i+1) as u32).unwrap().raw;
-				unsafe { v1.data.id == v2.data.id && v1.tag == v2.tag }
-			}) {
-				return Ok(Value::null());
-			}
+					Ok(())
+				})
+			})?;
+
+			src.call("set_visuals", &[&Value::from(overlay_types)])
 		}
 	}
-	let l = List::new();
-	for v in overlay_types.iter() {
-		l.append(v);
-	}
-	src.call("set_visuals", &[&Value::from(l)])
 }
-*/
-
-pub const SIMULATION_LEVEL_NONE: u8 = 0;
-pub const SIMULATION_LEVEL_DIFFUSE: u8 = 1;
-pub const SIMULATION_LEVEL_ALL: u8 = 2;
-pub const SIMULATION_LEVEL_ANY: u8 = SIMULATION_LEVEL_DIFFUSE | SIMULATION_LEVEL_ALL;
-pub const SIMULATION_LEVEL_DISABLED: u8 = 4;
 
 fn adjacent_tile_id(id: u8, i: TurfID, max_x: i32, max_y: i32) -> TurfID {
 	let z_size = max_x * max_y;

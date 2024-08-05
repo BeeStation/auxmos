@@ -18,8 +18,11 @@ use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 
 use std::collections::BTreeMap;
 
+use eyre::Result;
+
 type SpecificFireInfo = (usize, f32, f32);
 
+#[derive(Debug)]
 struct GasCache(AtomicF32);
 
 impl Clone for GasCache {
@@ -69,7 +72,7 @@ pub fn visibility_step(gas_amt: f32) -> u32 {
 /// processing no longer requires sleeping turfs. Instead, we're using
 /// a proper, fully-simulated FDM system, much like LINDA but without
 /// sleeping turfs.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct Mixture {
 	temperature: f32,
 	pub volume: f32,
@@ -137,13 +140,8 @@ impl Mixture {
 	/// Allows closures to iterate over each gas.
 	/// # Errors
 	/// If the closure errors.
-	pub fn for_each_gas(
-		&self,
-		mut f: impl FnMut(GasIDX, f32) -> Result<(), auxtools::Runtime>,
-	) -> Result<(), auxtools::Runtime> {
-		for (i, g) in self.enumerate() {
-			f(i, g)?;
-		}
+	pub fn for_each_gas(&self, mut f: impl FnMut(GasIDX, f32) -> Result<()>) -> Result<()> {
+		self.enumerate().try_for_each(|(i, g)| f(i, g))?;
 		Ok(())
 	}
 	/// As `for_each_gas`, but with mut refs to the mole counts instead of copies.
@@ -151,11 +149,12 @@ impl Mixture {
 	/// If the closure errors.
 	pub fn for_each_gas_mut(
 		&mut self,
-		mut f: impl FnMut(GasIDX, &mut f32) -> Result<(), auxtools::Runtime>,
-	) -> Result<(), auxtools::Runtime> {
-		for (i, g) in self.moles.iter_mut().enumerate() {
-			f(i, g)?;
-		}
+		mut f: impl FnMut(GasIDX, &mut f32) -> Result<()>,
+	) -> Result<()> {
+		self.moles
+			.iter_mut()
+			.enumerate()
+			.try_for_each(|(i, g)| f(i, g))?;
 		Ok(())
 	}
 	/// Returns (by value) the amount of moles of a given index the mix has. M
@@ -181,7 +180,7 @@ impl Mixture {
 			&& idx < total_num_gases()
 			&& (idx <= self.moles.len() || (amt > GAS_MIN_MOLES && amt.is_normal()))
 		{
-			self.maybe_expand((idx + 1) as usize);
+			self.maybe_expand(idx + 1);
 			unsafe {
 				*self.moles.get_unchecked_mut(idx) = amt;
 			};
@@ -190,7 +189,7 @@ impl Mixture {
 	}
 	pub fn adjust_moles(&mut self, idx: GasIDX, amt: f32) {
 		if !self.immutable && amt.is_normal() && idx < total_num_gases() {
-			self.maybe_expand((idx + 1) as usize);
+			self.maybe_expand(idx + 1);
 			let r = unsafe { self.moles.get_unchecked_mut(idx) };
 			*r += amt;
 			if amt <= 0.0 {
@@ -272,9 +271,10 @@ impl Mixture {
 		let our_heat_capacity = self.heat_capacity();
 		let other_heat_capacity = giver.heat_capacity();
 		self.maybe_expand(giver.moles.len());
-		for (a, b) in self.moles.iter_mut().zip(giver.moles.iter()) {
-			*a += b;
-		}
+		self.moles
+			.iter_mut()
+			.zip(giver.moles.iter())
+			.for_each(|(a, b)| *a += b);
 		let combined_heat_capacity = our_heat_capacity + other_heat_capacity;
 		if combined_heat_capacity > MINIMUM_HEAT_CAPACITY {
 			self.set_temperature(
@@ -294,9 +294,10 @@ impl Mixture {
 		let our_heat_capacity = self.heat_capacity();
 		let other_heat_capacity = giver.heat_capacity() * ratio;
 		self.maybe_expand(giver.moles.len());
-		for (a, b) in self.moles.iter_mut().zip(giver.moles.iter()) {
-			*a += b * ratio;
-		}
+		self.moles
+			.iter_mut()
+			.zip(giver.moles.iter())
+			.for_each(|(a, b)| *a += b * ratio);
 		let combined_heat_capacity = our_heat_capacity + other_heat_capacity;
 		if combined_heat_capacity > MINIMUM_HEAT_CAPACITY {
 			self.set_temperature(
@@ -466,18 +467,14 @@ impl Mixture {
 	/// Multiplies every gas molage with this value.
 	pub fn multiply(&mut self, multiplier: f32) {
 		if !self.immutable {
-			for amt in self.moles.iter_mut() {
-				*amt *= multiplier;
-			}
+			self.moles.iter_mut().for_each(|amt| *amt *= multiplier);
 			self.cached_heat_capacity.invalidate();
 			self.garbage_collect();
 		}
 	}
 	pub fn add(&mut self, num: f32) {
 		if !self.immutable {
-			for amt in self.moles.iter_mut() {
-				*amt += num;
-			}
+			self.moles.iter_mut().for_each(|amt| *amt += num);
 			self.cached_heat_capacity.invalidate();
 			self.garbage_collect();
 		}
@@ -504,7 +501,8 @@ impl Mixture {
 		reactions
 			.values()
 			.rev()
-			.filter_map(|thin| thin.check_conditions(self).then(|| thin.get_id()))
+			.filter(|thin| thin.check_conditions(self))
+			.map(|thin| thin.get_id())
 			.collect()
 	}
 	/// Gets all of the reactions this mix should do.
@@ -599,20 +597,22 @@ impl Mixture {
 	/// Returns true if there's a visible gas in this mix.
 	pub fn is_visible(&self) -> bool {
 		self.enumerate()
-			.any(|(i, gas)| gas_visibility(i as usize).map_or(false, |amt| gas >= amt))
+			.any(|(i, gas)| gas_visibility(i).map_or(false, |amt| gas >= amt))
 	}
 	pub fn vis_hash(&self, gas_visibility: &[Option<f32>]) -> u64 {
 		use std::hash::Hasher;
 		let mut hasher: ahash::AHasher = ahash::AHasher::default();
-		for (i, gas_amt) in self.enumerate() {
-			if unsafe { gas_visibility.get_unchecked(i) }
-				.filter(|&amt| gas_amt > amt)
-				.is_some()
-			{
+
+		self.enumerate()
+			.filter(|&(i, gas_amt)| {
+				unsafe { gas_visibility.get_unchecked(i) }
+					.filter(|&amt| gas_amt > amt)
+					.is_some()
+			})
+			.for_each(|(i, gas_amt)| {
 				hasher.write_usize(i);
 				hasher.write_usize(visibility_step(gas_amt) as usize)
-			}
-		}
+			});
 		hasher.finish()
 	}
 	/// Compares the current vis hash to the provided one; returns true if they are
@@ -622,11 +622,8 @@ impl Mixture {
 		hash_holder: &AtomicU64,
 	) -> bool {
 		let cur_hash = self.vis_hash(gas_visibility);
-		hash_holder
-			.fetch_update(Relaxed, Relaxed, |item| {
-				(item != cur_hash).then_some(cur_hash)
-			})
-			.is_ok()
+		let old_hash = hash_holder.swap(cur_hash, Relaxed);
+		old_hash == 0 || old_hash != cur_hash
 	}
 	// Removes all redundant zeroes from the gas mixture.
 	pub fn garbage_collect(&mut self) {
@@ -716,19 +713,19 @@ mod tests {
 	}
 
 	#[test]
-	fn test_merge() {
+	fn test_gases() {
 		initialize_gases();
 		let mut into = Mixture::new();
 		into.set_moles(0, 82.0);
 		into.set_moles(1, 22.0);
 		into.set_temperature(293.15);
 		let mut source = Mixture::new();
-		source.set_moles(3, 100.0);
+		source.set_moles(2, 100.0);
 		source.set_temperature(313.15);
 		into.merge(&source);
 		// make sure that the merge successfuly moved the moles
-		assert_eq!(into.get_moles(3), 100.0);
-		assert_eq!(source.get_moles(3), 100.0); // source is not modified by merge
+		assert_eq!(into.get_moles(2), 100.0);
+		assert_eq!(source.get_moles(2), 100.0); // source is not modified by merge
 										/*
 										make sure that the merge successfuly changed the temperature of the mix merged into:
 										test gases have heat capacities of (82 * 20 + 22 * 20) and (100 * 20) respectively, so total thermal energies of
@@ -745,11 +742,8 @@ mod tests {
 			into.get_temperature(),
 			(into.get_temperature() - 302.953)
 		);
-		destroy_gas_statics();
-	}
-	#[test]
-	fn test_remove() {
-		initialize_gases();
+
+		// test merges
 		// also tests multiply, copy_from_mutable
 		let mut removed = Mixture::new();
 		removed.set_moles(0, 22.0);

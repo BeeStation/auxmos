@@ -10,5 +10,8 @@ edition = "2018"
 crate-type = ["lib"]
 
 [dependencies]
-auxtools = { git = "https://github.com/willox/auxtools" }
-flume = "0.10.14"
+byondapi = { workspace = true }
+flume = { workspace = true }
+coarsetime = { workspace = true }
+eyre = { workspace = true }
+tracing = { workspace = true }
